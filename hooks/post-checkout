@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${DIR}/../lib/shared.bash"
+
+if [[ "$(plugin_read_config DEBUG false)" =~ ^(true|on|1)$ ]]; then
+  set -x
+fi
+
+# Pre-flight: verify Python 3 is available on the host agent.
+if [[ -z "${PYTHON3_CMD}" ]]; then
+  echo "+++ :rotating_light: qdb-cache plugin requires python3 on the host agent"
+  echo "Install Python 3 on this agent or add it to the AMI via Packer."
+  exit 1
+fi
+
+REQUIREMENTS="${PLUGIN_DIR}/lib/requirements.txt"
+"${PYTHON3_CMD}" "${PLUGIN_DIR}/lib/plugin_config.py" validate-state
+mkdir -p "${STATE_DIR}"
+
+if [[ -d "${VENV_DIR}" ]]; then
+  rm -rf "${VENV_DIR}"
+fi
+
+echo "~~~ :python: Setting up qdb-cache plugin"
+"${PYTHON3_CMD}" -m venv --upgrade-deps "${VENV_DIR}"
+"${VENV_BIN}/python" -m pip install --quiet \
+  --retries 3 --resume-retries 3 \
+  -r "${REQUIREMENTS}"
+

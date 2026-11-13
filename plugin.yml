@@ -1,0 +1,85 @@
+name: QDB Cache
+description: Restore and refresh branch-scoped file snapshots in S3 or Cloudflare R2
+author: https://github.com/bureau14
+requirements:
+  - bash
+  - python3
+configuration:
+  additionalProperties: false
+  required:
+    - path
+  properties:
+    path:
+      description: Literal files or directories combined into one snapshot
+      oneOf:
+        - type: string
+          minLength: 1
+        - type: array
+          minItems: 1
+          items:
+            type: string
+            minLength: 1
+    keys:
+      type: array
+      description: Pipeline-owned dimensions, sorted by their original case-sensitive keys
+      items:
+        type: object
+        additionalProperties: false
+        required:
+          - key
+          - value
+        properties:
+          key:
+            type: string
+            minLength: 1
+          value:
+            type: string
+    restore:
+      type: boolean
+      default: true
+    save:
+      type: boolean
+      default: true
+    fallback:
+      type: string
+      enum:
+        - default
+        - custom
+        - disabled
+      default: default
+    fallback-branches:
+      type: array
+      minItems: 1
+      items:
+        type: string
+        minLength: 1
+      description: Required ordered branch names or refs/heads/... refs for custom fallback
+    exclude:
+      oneOf:
+        - type: string
+          minLength: 1
+        - type: array
+          items:
+            type: string
+            minLength: 1
+    force:
+      type: boolean
+      default: false
+    strict:
+      type: boolean
+      default: false
+    retries:
+      type: integer
+      minimum: 1
+      default: 3
+    connect-timeout:
+      type: number
+      exclusiveMinimum: 0
+      default: 10
+    read-timeout:
+      type: number
+      exclusiveMinimum: 0
+      default: 60
+    debug:
+      type: boolean
+      default: false

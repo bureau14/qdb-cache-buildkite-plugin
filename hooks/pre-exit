@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! source "${DIR}/../lib/shared.bash"; then
+  exit 0
+fi
+
+# Windows locks the running interpreter, so teardown uses the host Python.
+if [[ -n "${PYTHON3_CMD}" ]]; then
+  "${PYTHON3_CMD}" "${PLUGIN_DIR}/lib/plugin_config.py" cleanup || true
+fi
+exit 0
+

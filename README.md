@@ -1,6 +1,6 @@
 # qdb-cache-buildkite-plugin
 
-Caches files and directories from the working directory in AWS S3 or Cloudflare R2. Each pipeline, Git ref, and optional set of keys has one cache archive. Restore runs before the command; successful commands update the stored cache afterwards.
+Caches files and directories from the working directory in AWS S3 or Cloudflare R2. Caches are separated by pipeline, configured keys, and Git ref by default. Restore runs before the command; successful commands update the stored cache afterwards.
 
 ## Requirements
 
@@ -52,6 +52,7 @@ plugins:
 | --- | --- | --- |
 | `path` | Required | File or directory path, or a nonempty list of paths, relative to the working directory. |
 | `keys` | Empty list | Key/value pairs selecting an independent cache. Keys must be nonempty and unique; values are strings and may be empty. |
+| `git-ref` | `true` | Include the Git ref in cache identity. Disable to share a cache across branches and tags. |
 | `restore` | `true` | Restore before the command. |
 | `save` | `true` | Create or update the stored cache after a successful command. |
 | `fallback` | `default` | Try master then main after the current ref, or use `disabled` for only the current ref. |
@@ -93,7 +94,9 @@ s3://ci-cache/buildkite/example/refs/heads/feature/cache/v1/snapshot.tar.zst
 
 Use `keys` to separate caches for different steps, operating systems, or toolchains. Tags take precedence over branches.
 
-Restore tries the current ref, then master and main. Set `fallback: disabled` to use only the current ref. Saving always updates the current ref's cache.
+By default, restore tries the current ref, then master and main. Set `fallback: disabled` to use only the current ref. Saving updates the current ref's cache.
+
+With `git-ref: false`, branches and tags restore and update the same cache for the pipeline and configured keys. Ref fallback is ignored.
 
 ### Snapshots
 

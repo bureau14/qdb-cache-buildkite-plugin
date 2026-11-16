@@ -72,7 +72,7 @@ def _stage_snapshot(config: CacheConfig, response: dict, tmp_dir: Path, result: 
 
 
 def restore(config: CacheConfig, tmp_dir: Path) -> dict:
-    """Restore the current ref or a fallback, stopping once live installation starts."""
+    """Restore a matching cache snapshot."""
     try:
         client, bucket, prefix = object_store.open_store(config)
     except ValueError as exc:
@@ -81,20 +81,21 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
     try:
         for index, ref in enumerate(config.fallback_refs):
             key = config.object_key(prefix, ref)
+            ref_label = ref or "shared"
             candidate_tmp_dir = tmp_dir / f"candidate-{index}"
             candidate_tmp_dir.mkdir()
             response = None
             try:
                 response = object_store.get_snapshot(client, bucket, key)
                 if response is None:
-                    log(f"missing ref={ref!r}")
+                    log(f"missing ref={ref_label!r}")
                     continue
                 prepared = _stage_snapshot(config, response, candidate_tmp_dir, result)
                 if prepared is None:
-                    log(f"incompatible ref={ref!r}")
+                    log(f"incompatible ref={ref_label!r}")
                     continue
             except Exception as exc:
-                result["errors"].append(f"ref={ref!r}: {exc}")
+                result["errors"].append(f"ref={ref_label!r}: {exc}")
                 if config.strict:
                     result["outcome"] = "error"
                     return result
@@ -108,10 +109,10 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
             except Exception as exc:
                 # Installing cached files preserves unrelated live files but can stop
                 # partway; another candidate cannot safely repair a partial merge.
-                result["errors"].append(f"merge ref={ref!r}: {exc}")
+                result["errors"].append(f"merge ref={ref_label!r}: {exc}")
                 result["outcome"] = "error"
                 return result
-            log(f"restored source-ref={ref!r} target-ref={config.git_ref!r}")
+            log(f"restored source-ref={ref_label!r} target-ref={config.git_ref or 'shared'!r}")
             result["outcome"] = "restored"
             return result
         return result
@@ -120,7 +121,7 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
 
 
 def save(config: CacheConfig, tmp_dir: Path) -> dict:
-    """Publish changed cached files to the current ref's stored snapshot."""
+    """Publish changed cached files."""
     tar_path = tmp_dir / "snapshot.tar"
     digest = archive.create_tar(config.working_dir, config.roots, config.exclusions, tar_path)
     if digest is None:
@@ -184,7 +185,7 @@ def run(operation: str) -> int:
     fatal = bool(result.get("fatal") or (errors and config.strict))
     log(
         f"{operation} outcome={result['outcome']!r} identity={config.identity!r} "
-        f"target-ref={config.git_ref!r} bytes={result.get('bytes', 'unknown')} "
+        f"target-ref={config.git_ref or 'shared'!r} bytes={result.get('bytes', 'unknown')} "
         f"duration={time.monotonic() - started:.3f}s"
     )
     if errors:

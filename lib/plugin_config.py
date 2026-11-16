@@ -23,11 +23,11 @@ class CacheConfig:
     pairs: dict[str, str]
     exclusions: tuple[str, ...]
     pipeline: str
-    git_ref: str
+    git_ref: str | None
     state_dir: Path
     restore: bool
     save: bool
-    fallback_refs: tuple[str, ...]
+    fallback_refs: tuple[str | None, ...]
     force: bool
     strict: bool
     retries: int
@@ -45,17 +45,17 @@ class CacheConfig:
 
     @property
     def identity(self) -> str:
-        # Encode delimiters so diagnostics distinguish keys containing "/" or "=".
-        return "/".join(
-            [self.pipeline, self.git_ref]
-            + [f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in self.pairs.items()]
-        )
+        parts = [self.pipeline]
+        if self.git_ref is not None:
+            parts.append(self.git_ref)
+        parts.extend(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in self.pairs.items())
+        return "/".join(parts)
 
     def object_key(self, prefix: str, git_ref: str | None = None) -> str:
         parts = [
             prefix.strip("/"),
             self.pipeline,
-            git_ref or self.git_ref,
+            (git_ref or self.git_ref) if self.git_ref is not None else None,
             "cache",
             f"v{CACHE_FORMAT_VERSION}",
         ]
@@ -135,14 +135,15 @@ def load_config(
     cwd = Path.cwd() if cwd is None else cwd
     job_id = env["BUILDKITE_JOB_ID"]
     pipeline = env["BUILDKITE_PIPELINE_SLUG"]
-    git_ref = _current_buildkite_git_ref(env)
-    if git_ref is None:
+    use_git_ref = _boolean(env, "GIT_REF", True)
+    git_ref = _current_buildkite_git_ref(env) if use_git_ref else None
+    if use_git_ref and git_ref is None:
         raise ValueError("BUILDKITE_BRANCH or BUILDKITE_TAG is required")
     mode = env.get(PREFIX + "FALLBACK", "default")
     if mode not in {"default", "disabled"}:
         raise ValueError("fallback must be default or disabled")
     refs = [git_ref]
-    if mode == "default":
+    if git_ref is not None and mode == "default":
         refs.extend(ref for ref in ("refs/heads/master", "refs/heads/main") if ref != git_ref)
     try:
         retries = int(env.get(PREFIX + "RETRIES", "3"))

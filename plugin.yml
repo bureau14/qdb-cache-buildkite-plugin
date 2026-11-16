@@ -34,6 +34,10 @@ configuration:
             minLength: 1
           value:
             type: string
+    git-ref:
+      type: boolean
+      description: Include the Git ref in cache identity
+      default: true
     restore:
       type: boolean
       default: true

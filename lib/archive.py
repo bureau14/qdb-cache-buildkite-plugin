@@ -62,36 +62,14 @@ def sha256_file(path: Path) -> str:
 
 
 def _assert_tar_path_is_safe(out, name):
-    normalized = posixpath.normpath(name)
-    if normalized in ("", ".") or normalized.startswith("../") or normalized == "..":
+    if not Path(name).parts or ".." in Path(name).parts:
         raise tarfile.TarError(f"refusing unsafe tar member path: {name}")
-    if posixpath.isabs(normalized):
+    if posixpath.isabs(name):
         raise tarfile.TarError(f"refusing absolute tar member path: {name}")
 
     out = out.resolve()
-    target = (out / normalized).resolve()
-    try:
-        target.relative_to(out)
-    except ValueError as exc:
-        raise tarfile.TarError(f"refusing tar member outside output dir: {name}") from exc
-    return target
-
-
-def _safe_tar_member(member, out):
-    """Apply Python 3.12-style data filtering without the 3.12-only
-    TarFile.extract(..., filter=...) keyword.
-
-    On Python versions with tarfile.data_filter, delegate to the stdlib
-    implementation. Otherwise reject traversal/absolute paths directly.
-    Only regular files and directories are supported.
-    """
-    if not (member.isdir() or member.isreg()):
-        raise tarfile.TarError(f"unsupported tar entry: {member.name!r}")
-    _assert_tar_path_is_safe(out, member.name)
-    data_filter = getattr(tarfile, "data_filter", None)
-    if data_filter is not None:
-        return data_filter(member, str(out))
-    return member
+    if not (out / name).resolve().is_relative_to(out):
+        raise tarfile.TarError(f"refusing tar member outside output dir: {name}")
 
 
 def validate_tar(tar_path: Path, roots: tuple[CacheRoot, ...], staging: Path):
@@ -99,11 +77,12 @@ def validate_tar(tar_path: Path, roots: tuple[CacheRoot, ...], staging: Path):
     members = {}
     with tarfile.open(tar_path, "r:") as tar:
         for member in tar:
-            if ".." in Path(member.name).parts:
-                raise tarfile.TarError(f"refusing unsafe tar member path: {member.name!r}")
             if "/".join(member.name.split("/")[:2]) not in expected:
                 raise tarfile.TarError(f"unexpected archive root: {member.name!r}")
-            _safe_tar_member(member, staging)
+            if not (member.isdir() or member.isreg()):
+                raise tarfile.TarError(f"unsupported tar entry: {member.name!r}")
+            # extractfile() supplies bytes; our manual writes need their own path boundary.
+            _assert_tar_path_is_safe(staging, member.name)
             members[member.name] = member
     if not members:
         raise tarfile.TarError("snapshot contains no roots")
@@ -129,24 +108,24 @@ def _live_path(name: str, roots: tuple[CacheRoot, ...]) -> Path:
     root = next(root for root in roots if root.archive_name == "/".join(parts[:2]))
     if root.destination.is_symlink():
         raise tarfile.TarError(f"refusing destination symlink: {str(root.destination)!r}")
-    if len(parts) == 2:
-        return root.destination
-    _assert_tar_path_is_safe(root.destination, parts[2])
-    return root.destination / parts[2]
+    path = root.destination
+    if len(parts) == 3:
+        _assert_tar_path_is_safe(path, parts[2])
+        path = path / parts[2]
+    if path.is_symlink():
+        raise tarfile.TarError(f"refusing destination symlink: {str(path)!r}")
+    return path
 
 
-def _metadata(path: Path, member: tarfile.TarInfo) -> None:
-    os.chmod(path, member.mode & 0o777)
-    os.utime(path, (member.mtime, member.mtime))
+def _restore_metadata(path: Path, mode: int, mtime: float) -> None:
+    # Temporary-file replacement loses executable bits; changed mtimes also alter
+    # the tar digest used to skip unchanged uploads.
+    os.chmod(path, mode & 0o777)
+    os.utime(path, (mtime, mtime))
 
 
 def merge_staged(staging: Path, roots: tuple[CacheRoot, ...], members) -> None:
     entries = [(name, member, _live_path(name, roots)) for name, member in sorted(members.items())]
-    for _, member, path in entries:
-        if path.is_symlink():
-            raise tarfile.TarError(f"refusing destination symlink: {str(path)!r}")
-        if path.exists() and path.is_dir() != member.isdir():
-            raise tarfile.TarError(f"file/directory conflict: {str(path)!r}")
     for name, member, path in entries:
         path.parent.mkdir(parents=True, exist_ok=True)
         if member.isdir():
@@ -159,10 +138,11 @@ def merge_staged(staging: Path, roots: tuple[CacheRoot, ...], members) -> None:
             temporary = Path(data.name)
         try:
             shutil.copyfile(staging / name, temporary)
-            _metadata(temporary, member)
+            _restore_metadata(temporary, member.mode, member.mtime)
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
+    # Apply directory metadata last so read-only modes do not block child writes.
     for _, member, path in reversed(entries):
         if member.isdir():
-            _metadata(path, member)
+            _restore_metadata(path, member.mode, member.mtime)

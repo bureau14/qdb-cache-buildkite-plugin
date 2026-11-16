@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -11,7 +10,7 @@ from urllib.parse import urlparse
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError, ParamValidationError
+from botocore.exceptions import ClientError
 
 from plugin_config import CacheConfig
 
@@ -65,9 +64,9 @@ _PLACEHOLDER_PREFIXES = ("SET_ME", "REPLACE_", "TODO", "CHANGEME", "FIXME")
 
 
 def _check_placeholder(value, label):
-    """Die if value looks like a placeholder that was never replaced with a real one."""
+    """Reject credentials that still contain an unconfigured placeholder."""
     if value and any(value.startswith(p) for p in _PLACEHOLDER_PREFIXES):
-        die(
+        raise ValueError(
             f"{label} contains an unconfigured placeholder — "
             f"replace it with the real credential in Terraform tfvars or SSM"
         )
@@ -90,7 +89,7 @@ def load_store_config(ssm):
     )
 
     if backend not in {"s3", "r2"}:
-        die(
+        raise ValueError(
             f"unsupported artifact backend: {backend!r} (expected 's3' or 'r2'). "
             f"Check env var ARTIFACTS_BACKEND or SSM parameter {BACKEND_SSM_PARAM}"
         )
@@ -99,7 +98,7 @@ def load_store_config(ssm):
         ssm, DESTINATION_SSM_PARAM
     )
     if not destination:
-        die(
+        raise ValueError(
             f"artifact destination not configured. "
             f"Set env var ARTIFACTS_DESTINATION or SSM parameter {DESTINATION_SSM_PARAM}"
         )
@@ -116,7 +115,7 @@ def load_store_config(ssm):
 
         r2_account_id = _env_or_ssm(ssm, "ARTIFACTS_R2_ACCOUNT_ID", R2_ACCOUNT_ID_SSM_PARAM)
         if not r2_account_id:
-            die(
+            raise ValueError(
                 f"R2 backend requires Cloudflare account ID. "
                 f"Set env var ARTIFACTS_R2_ACCOUNT_ID or SSM parameter {R2_ACCOUNT_ID_SSM_PARAM}"
             )
@@ -128,7 +127,7 @@ def load_store_config(ssm):
             R2_ACCESS_KEY_ID_SSM_PARAM,
         )
         if not r2_access_key_id:
-            die(
+            raise ValueError(
                 f"R2 backend requires access key ID. "
                 f"Set env var ARTIFACTS_R2_ACCESS_KEY_ID or SSM parameter {R2_ACCESS_KEY_ID_SSM_PARAM}"
             )
@@ -141,7 +140,7 @@ def load_store_config(ssm):
             with_decryption=True,
         )
         if not r2_secret_access_key:
-            die(
+            raise ValueError(
                 f"R2 backend requires secret access key. "
                 f"Set env var ARTIFACTS_R2_SECRET_ACCESS_KEY or SSM SecureString {R2_SECRET_ACCESS_KEY_SSM_PARAM}"
             )
@@ -219,10 +218,6 @@ def _s3_client(cfg, auth, operation: CacheConfig):
     return boto3.client("s3", **kwargs)
 
 
-def die(msg):
-    raise ValueError(msg)
-
-
 def sdk_config(operation: CacheConfig, **kwargs):
     return Config(
         connect_timeout=operation.connect_timeout,
@@ -239,90 +234,37 @@ def aws_clients(operation: CacheConfig):
     return session.client("ssm", config=sdk_config(operation, region_name=region_name))
 
 
-def _is_client_config_error(exc: Exception) -> bool:
-    # Botocore validation exceptions lack a shared base class. Constructor-only
-    # Invalid/Config families are deterministic setup errors; credential/transport
-    # failures are re-raised for the operational policy.
-    return isinstance(exc, (ValueError, ParamValidationError)) or any(
-        base.__name__.startswith("Invalid")
-        or "Config" in base.__name__
-        or base.__name__ == "ProfileNotFound"
-        for base in type(exc).__mro__
-    )
-
-
 def open_store(operation: CacheConfig):
-    try:
-        ssm = aws_clients(operation)
-    except (ValueError, BotoCoreError) as exc:
-        if not _is_client_config_error(exc):
-            raise
-        raise ValueError("invalid AWS configuration for the SSM client") from exc
+    ssm = aws_clients(operation)
     try:
         cfg = load_store_config(ssm)
-        if cfg.endpoint_url:
-            try:
-                endpoint = urlparse(cfg.endpoint_url)
-                valid = (
-                    endpoint.scheme in {"http", "https"}
-                    and endpoint.hostname
-                    and endpoint.port != 0
-                    and not endpoint.username
-                    and not endpoint.password
-                    and not endpoint.query
-                    and not endpoint.fragment
-                    and "\\" not in cfg.endpoint_url
-                    and not any(c.isspace() or ord(c) < 32 for c in cfg.endpoint_url)
-                )
-            except ValueError as exc:
-                raise ValueError("ARTIFACTS_ENDPOINT_URL must be a valid HTTP(S) endpoint") from exc
-            if not valid:
-                raise ValueError("ARTIFACTS_ENDPOINT_URL must be a valid HTTP(S) endpoint")
-        try:
-            bucket, prefix = parse_s3(cfg.destination)
-            parsed = urlparse(cfg.destination)
-        except ValueError as exc:
-            raise ValueError("ARTIFACTS_DESTINATION contains an invalid URI") from exc
-        # Match SDK bucket-parameter syntax while preserving legacy SSM bucket
-        # names; backend-specific naming and authorization remain backend-owned.
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,255}", bucket):
-            raise ValueError("ARTIFACTS_DESTINATION must be s3://bucket/prefix or a bucket name")
-        if cfg.destination.startswith("s3://") and (parsed.query or parsed.fragment):
-            raise ValueError("ARTIFACTS_DESTINATION cannot contain a query or fragment")
-        try:
-            client = _s3_client(cfg, resolve_object_auth(ssm, cfg, "read-write"), operation)
-        except (ValueError, BotoCoreError) as exc:
-            if not _is_client_config_error(exc):
-                raise
-            # SDK endpoint/region validation happens during client construction,
-            # before requests; malformed configuration must remain fatal.
-            raise ValueError("invalid resolved storage endpoint or client configuration") from exc
+        bucket, prefix = parse_s3(cfg.destination)
+        client = _s3_client(cfg, resolve_object_auth(ssm, cfg, "read-write"), operation)
         return client, bucket, prefix
     finally:
         ssm.close()
 
 
 def is_missing(exc: ClientError) -> bool:
-    # Authorization failures (including ambiguous 403s) must never become misses.
-    return str(exc.response.get("Error", {}).get("Code", "")) in {"NoSuchKey", "NotFound", "404"}
+    return exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404")
 
 
 def head_snapshot(client, bucket: str, key: str):
     try:
         return client.head_object(Bucket=bucket, Key=key).get("Metadata", {})
     except ClientError as exc:
-        if is_missing(exc):
-            return None
-        raise
+        if not is_missing(exc):
+            raise
+        return None
 
 
 def get_snapshot(client, bucket: str, key: str):
     try:
         return client.get_object(Bucket=bucket, Key=key)
     except ClientError as exc:
-        if is_missing(exc):
-            return None
-        raise
+        if not is_missing(exc):
+            raise
+        return None
 
 
 def upload_snapshot(client, bucket: str, key: str, path: Path, metadata: dict[str, str]):

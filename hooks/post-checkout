@@ -16,7 +16,6 @@ if [[ -z "${PYTHON3_CMD}" ]]; then
 fi
 
 REQUIREMENTS="${PLUGIN_DIR}/lib/requirements.txt"
-"${PYTHON3_CMD}" "${PLUGIN_DIR}/lib/plugin_config.py" validate-state
 mkdir -p "${STATE_DIR}"
 
 if [[ -d "${VENV_DIR}" ]]; then

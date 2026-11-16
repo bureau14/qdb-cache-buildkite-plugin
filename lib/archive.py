@@ -16,13 +16,42 @@ import zstandard
 BLOCK = 1024 * 1024
 
 
+def _has_symlink(working_dir: Path, relative: Path) -> bool:
+    path = working_dir
+    # A regular leaf can still traverse a symlinked directory outside the checkout.
+    for part in relative.parts:
+        path = path / part
+        if path.is_symlink():
+            return True
+    return False
+
+
+def _checked_path(working_dir: Path, relative: Path) -> Path:
+    path = working_dir / relative
+    if (
+        relative.anchor
+        or ".." in relative.parts
+        or _has_symlink(working_dir, relative)
+        or not path.resolve().is_relative_to(working_dir)
+    ):
+        raise tarfile.TarError(f"unsafe cache path: {str(relative)!r}")
+    return path
+
+
 def _include_member(member, root: Path, working_dir: Path, exclusions: tuple[str, ...]):
+    if member.issym():
+        return None
     relative = Path(member.name).relative_to(root)
-    path = working_dir / member.name
+    path = _checked_path(working_dir, Path(member.name))
     pattern = relative.as_posix() if relative.parts else (root.name if not member.isdir() else "")
     if pattern and any(fnmatch.fnmatchcase(pattern, p) for p in exclusions):
         return None
-    if path.is_symlink() or not (member.isreg() or member.isdir()):
+    # Hard links still capture independent file contents without following symlinks.
+    if member.islnk():
+        member.type = tarfile.REGTYPE
+        member.linkname = ""
+        member.size = path.stat().st_size
+    if not (member.isreg() or member.isdir()):
         raise tarfile.TarError(f"unsupported input type: {str(path)!r}")
     # Ownership varies between agents and must not change the checksum.
     member.uid = member.gid = 0
@@ -37,9 +66,12 @@ def create_tar(
     working_dir: Path, roots: tuple[Path, ...], exclusions: tuple[str, ...], output: Path
 ):
     """Capture working-directory paths with stable metadata for checksum comparison."""
-    if any(not (working_dir / root).exists() for root in roots):
+    working_dir = working_dir.resolve()
+    roots = tuple(root for root in roots if not _has_symlink(working_dir, root))
+    if any(not _checked_path(working_dir, root).exists() for root in roots):
         return None
-    with tarfile.open(output, "w", format=tarfile.PAX_FORMAT, dereference=True) as tar:
+    # lstat lets the filter skip even dangling symlinks before their targets are read.
+    with tarfile.open(output, "w", format=tarfile.PAX_FORMAT, dereference=False) as tar:
         for root in roots:
             tar.add(
                 working_dir / root,
@@ -109,9 +141,10 @@ def extract_staged(tar_path: Path, staging: Path, members: dict[str, tarfile.Tar
 
 def merge_staged(staging: Path, working_dir: Path, members) -> None:
     """Restore staged files to a clean checkout, applying directory modes last."""
+    working_dir = working_dir.resolve()
     entries = sorted(members.items())
     for name, member in entries:
-        path = working_dir / name
+        path = _checked_path(working_dir, Path(name))
         path.parent.mkdir(parents=True, exist_ok=True)
         if member.isdir():
             path.mkdir(exist_ok=True)
@@ -125,10 +158,10 @@ def merge_staged(staging: Path, working_dir: Path, members) -> None:
             shutil.copyfile(staging / name, temporary)
             # Temporary files start at 0600; retain cached executable/access bits.
             os.chmod(temporary, member.mode & 0o777)
-            os.replace(temporary, path)
+            os.replace(temporary, _checked_path(working_dir, Path(name)))
         finally:
             temporary.unlink(missing_ok=True)
     # Apply directory modes last so read-only modes do not block child writes.
     for name, member in reversed(entries):
         if member.isdir():
-            os.chmod(working_dir / name, member.mode & 0o777)
+            os.chmod(_checked_path(working_dir, Path(name)), member.mode & 0o777)

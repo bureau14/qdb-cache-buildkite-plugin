@@ -81,6 +81,7 @@ exclude:
 | `post-checkout` | Prepare the job's Python environment. |
 | `pre-command` | Restore the cache. |
 | `post-command` | Update the stored cache after command success. |
+| `pre-exit` | Remove the job's Python environment and temporary state, including after failures or when saving is disabled. |
 
 A missing cache is normal. Operational errors are logged and annotated; the command continues unless `strict` is enabled.
 
@@ -100,7 +101,7 @@ With `git-ref: false`, branches and tags restore and update the same cache for t
 
 ### Snapshots
 
-Snapshots preserve working-directory-relative paths, file contents, and permissions. Modification times are excluded from the checksum; unchanged snapshots skip uploading. Regular files and directories are supported; symbolic links are not.
+Snapshots preserve working-directory-relative paths, file contents, and permissions. Modification times are excluded from the checksum; unchanged snapshots skip uploading. Regular files and directories are supported. Saving skips symbolic links and input paths with symlinked ancestors. Restore rejects symlinked destination components.
 
 Missing inputs or snapshots with no files skip saving. Restore preserves unrelated files. An interrupted restore can leave partially updated files, and concurrent saves can overwrite each other.
 

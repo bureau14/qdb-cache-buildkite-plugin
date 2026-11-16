@@ -1,4 +1,4 @@
-"""Inherited ARTIFACTS configuration and S3/R2 data access."""
+"""S3/R2 configuration and access adapted from bureau14/qdb-artifacts-buildkite-plugin."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ ENDPOINT_URL_SSM_PARAM = "/services/buildkite/config/artifacts/object-store/endp
 R2_ACCOUNT_ID_SSM_PARAM = "/services/buildkite/config/artifacts/object-store/r2/account-id"
 R2_ACCESS_KEY_ID_SSM_PARAM = "/services/buildkite/config/artifacts/object-store/r2/access-key-id"
 R2_SECRET_ACCESS_KEY_SSM_PARAM = "/services/buildkite/credentials/artifacts/r2/secret-access-key"
-ARTIFACTS_DOMAIN_SSM_PARAM = "/services/buildkite/config/artifacts/object-store/r2/artifacts-domain"
 
 
 @dataclass(frozen=True)
@@ -30,20 +29,8 @@ class StoreConfig:
     backend: str
     destination: str
     endpoint_url: str | None = None
-    r2_account_id: str | None = None
     r2_access_key_id: str | None = None
     r2_secret_access_key: str | None = None
-    artifacts_domain: str | None = None
-
-
-@dataclass(frozen=True)
-class ObjectAuth:
-    """Per-operation S3 credentials. All None for S3 (IAM role handles auth).
-    For R2, populated from SSM-stored credentials derived from the Cloudflare API token.
-    """
-
-    access_key_id: str | None = None
-    secret_access_key: str | None = None
 
 
 def _ssm_get_optional(ssm, name, with_decryption=True):
@@ -106,10 +93,6 @@ def load_store_config(ssm):
     # Applies to both backends; mainly for local MinIO / dev setups.
     endpoint_url = os.environ.get("ARTIFACTS_ENDPOINT_URL")
 
-    artifacts_domain = os.environ.get("ARTIFACTS_DOMAIN") or _ssm_get_optional(
-        ssm, ARTIFACTS_DOMAIN_SSM_PARAM
-    )
-
     if backend == "r2":
         endpoint_url = endpoint_url or _ssm_get_optional(ssm, ENDPOINT_URL_SSM_PARAM)
 
@@ -156,17 +139,14 @@ def load_store_config(ssm):
             backend=backend,
             destination=destination,
             endpoint_url=endpoint_url,
-            r2_account_id=r2_account_id,
             r2_access_key_id=r2_access_key_id,
             r2_secret_access_key=r2_secret_access_key,
-            artifacts_domain=artifacts_domain,
         )
 
     return StoreConfig(
         backend=backend,
         destination=destination,
         endpoint_url=endpoint_url,
-        artifacts_domain=artifacts_domain,
     )
 
 
@@ -179,22 +159,7 @@ def parse_s3(uri):
     return p.netloc, p.path.strip("/")
 
 
-def key_join(*parts):
-    """Join S3 key segments, dropping blanks to avoid double slashes."""
-    return "/".join(p.strip("/") for p in parts if p.strip("/"))
-
-
-def resolve_object_auth(ssm, cfg, permission):
-    """S3 → empty auth (IAM role chain). R2 → use stored S3-compatible credentials."""
-    if cfg.backend == "r2":
-        return ObjectAuth(
-            access_key_id=cfg.r2_access_key_id,
-            secret_access_key=cfg.r2_secret_access_key,
-        )
-    return ObjectAuth()
-
-
-def _s3_client(cfg, auth, operation: CacheConfig):
+def _s3_client(cfg, operation: CacheConfig):
     """Create an S3-compatible client using the artifacts plugin's backend settings.
 
     R2 needs signature_version=s3v4 and addressing_style=path (R2 endpoints are
@@ -211,9 +176,9 @@ def _s3_client(cfg, auth, operation: CacheConfig):
         kwargs["region_name"] = "auto"
     if cfg.endpoint_url:
         kwargs["endpoint_url"] = cfg.endpoint_url
-    if auth.access_key_id:
-        kwargs["aws_access_key_id"] = auth.access_key_id
-        kwargs["aws_secret_access_key"] = auth.secret_access_key
+    if cfg.backend == "r2":
+        kwargs["aws_access_key_id"] = cfg.r2_access_key_id
+        kwargs["aws_secret_access_key"] = cfg.r2_secret_access_key
 
     return boto3.client("s3", **kwargs)
 
@@ -239,7 +204,7 @@ def open_store(operation: CacheConfig):
     try:
         cfg = load_store_config(ssm)
         bucket, prefix = parse_s3(cfg.destination)
-        client = _s3_client(cfg, resolve_object_auth(ssm, cfg, "read-write"), operation)
+        client = _s3_client(cfg, operation)
         return client, bucket, prefix
     finally:
         ssm.close()

@@ -9,4 +9,3 @@ if [[ "$(plugin_read_config DEBUG false)" =~ ^(true|on|1)$ ]]; then
 fi
 
 run_cache_py restore
-

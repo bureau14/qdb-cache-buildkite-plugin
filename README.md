@@ -1,14 +1,10 @@
 # qdb-cache-buildkite-plugin
 
-Caches literal files and directories in AWS S3 or Cloudflare R2. Each pipeline, Git ref, and optional set of key/value dimensions owns one replaceable `snapshot.tar.zst`. Restore runs before the command; save runs after an explicitly successful command. Storage uses the QDB artifacts plugin's existing `ARTIFACTS_*` configuration and SSM parameters with a separate `cache/v1` subtree.
-
-## What it does
-
-Restores a file/directory snapshot before the command and refreshes it after success. Each pipeline, Git ref, and optional set of dimensions owns one object; restored files merge into existing destinations.
+Caches files and directories from the working directory in AWS S3 or Cloudflare R2. Each pipeline, Git ref, and optional set of keys has one cache archive. Restore runs before the command; successful commands update the stored cache afterwards.
 
 ## Requirements
 
-Bash and Python 3 must be available on the host agent. Setup installs `boto3` and `zstandard`; runtime support depends on their availability for the agent's Python and platform. The agent needs object-store permissions and the shared artifacts backend configuration described below.
+Bash and Python 3 must be available on the host agent. Storage access must be configured as described in [Backend configuration](#backend-configuration).
 
 ## Usage
 
@@ -22,134 +18,96 @@ steps:
       - bureau14/qdb-cache#master:
           path:
             - build/Testing/Temporary/CTestCostData.txt
-            - .cache/ccache
+            - .cache
           keys:
             - key: os
               value: linux
             - key: compiler
-              value: gcc-14
+              value: gcc15
 ```
 
-### Restore without saving
+### Restore without updating the stored cache
 
 ```yaml
 plugins:
   - bureau14/qdb-cache#master:
-      path: .cache/ccache
+      path: .cache
       save: false
 ```
 
-Set `restore: false` for a step that should only save. Both operations disabled still prepare the Python environment and parse configuration.
+Set `restore: false` for a step that should only update the stored cache.
 
 ### Disable branch fallback
 
 ```yaml
 plugins:
   - bureau14/qdb-cache#master:
-      path: .cache/ccache
+      path: .cache
       fallback: disabled
 ```
 
 ## Configuration reference
 
-Plugin options are declared in `plugin.yml` and parsed before storage access, including when both operations are disabled. The post-command hook skips saving before invoking Python when the command failed or its status is absent. Buildkite supplies `BUILDKITE_PLUGIN_QDB_CACHE_*` variables. Hyphenated names use underscores; string lists use contiguous zero-based indexes. Dimensions use records such as `BUILDKITE_PLUGIN_QDB_CACHE_KEYS_0_KEY` and `BUILDKITE_PLUGIN_QDB_CACHE_KEYS_0_VALUE`, retaining original dimension key spelling in their values. Boolean and scalar/indexed-list parsing follow the artifacts plugin's `_get_env_bool` and `_get_env_array` helpers; dimension-pair parsing is cache-specific. For booleans, whitespace is stripped, `true`/`1`/`on`/`yes` enable an option, and other supplied values disable it.
-
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `path` | Required | Nonempty string or list of literal file/directory paths combined into one snapshot. No globs or shell evaluation. |
-| `keys` | Empty list | Objects with a nonempty string `key` and string `value`. Empty values are allowed; duplicate keys are rejected. |
+| `path` | Required | File or directory path, or a nonempty list of paths, relative to the working directory. |
+| `keys` | Empty list | Key/value pairs selecting an independent cache. Keys must be nonempty and unique; values are strings and may be empty. |
 | `restore` | `true` | Restore before the command. |
-| `save` | `true` | Save after an explicitly successful command. |
+| `save` | `true` | Create or update the stored cache after a successful command. |
 | `fallback` | `default` | Try master then main after the current ref, or use `disabled` for only the current ref. |
-| `exclude` | Empty list | String or list of case-sensitive `fnmatchcase` patterns relative to each directory root; a file root uses its basename. |
-| `force` | `false` | Upload despite a matching checksum. Does not bypass command success, validation, or missing inputs. |
-| `strict` | `false` | Fail the hook on operational errors. Configuration/setup failures always fail. |
-| `retries` | `3` | Positive integer total SDK request attempts including the first; standard retry policy without an outer retry loop. |
-| `connect-timeout` | `10` | Positive connection timeout in seconds for storage and SSM clients. |
-| `read-timeout` | `60` | Positive response read timeout in seconds for storage and SSM clients. |
-| `debug` | `false` | Inherited Bash tracing around hook execution. |
+| `exclude` | Empty list | Case-sensitive glob pattern or list of patterns relative to each cached directory; a file path uses its basename. |
+| `force` | `false` | Update the stored cache even when its checksum matches. |
+| `strict` | `false` | Fail the hook on operational errors. Configuration and setup errors always fail. |
+| `retries` | `3` | Total SDK request attempts, including the first. |
+| `connect-timeout` | `10` | Positive finite connection timeout in seconds for storage and SSM requests. |
+| `read-timeout` | `60` | Positive finite read timeout in seconds for storage and SSM requests. |
+| `debug` | `false` | Enable Bash tracing. |
 
-Connection/read timeouts and retries apply to individual SDK requests. Restore and save run directly in the hook process without an overall operation deadline.
+Cache destinations must be clean and writable before restore. Paths stay within the working directory. Timeouts and retries apply per SDK request; there is no overall operation deadline.
 
-Relative paths resolve against the hook working directory. Explicit `~` paths expand locally while keeping the logical home specification independent of agent usernames. Absolute paths are supported. Configure distinct, nonoverlapping destinations containing regular files and directories. Paths and job state are trusted; there are no setup checks for filesystem roots, overlapping destinations, symlinks or Windows junctions in the state tree. Do not cache a checkout containing the plugin's own `.state` directory.
-
-Exclusions use POSIX `/` separators. `fnmatchcase` gives `**` no special recursive meaning, and `*` can match `/`. A matched directory is pruned with all descendants. Exclusions affect layout compatibility:
+For example, exclude lock files:
 
 ```yaml
 path: .cache
 exclude:
   - '*.lock'
-  - 'compiler/tmp'
-  - 'downloads/*.partial'
 ```
 
 ## How it works
 
-| Hook | Trigger | Action |
-| --- | --- | --- |
-| `post-checkout` | After checkout | Creates the job-specific Python environment and installs dependencies. |
-| `pre-command` | Before the command | Restores the current ref or its master/main fallback. |
-| `post-command` | After an explicitly successful command | Saves a changed snapshot for the current ref. |
-
-`post-checkout` discovers Python through `QDB_CICD_AGENT_PYTHON3`, then `python3`/`python` on PATH, then inherited Windows install-directory fallbacks. It recreates `.state/<BUILDKITE_JOB_ID>/.venv` using `python -m venv --upgrade-deps` and installs unpinned `boto3` and `zstandard` using the inherited pip retry flags. Linux/macOS/FreeBSD use `bin`; Windows/Git Bash uses `Scripts`. Setup failures are fatal. Runtime support follows dependency availability for the agent's Python and platform.
-
-`pre-command` restores; `post-command` parses configuration and saves only after command success. Both operations run directly in the hook process and remove temporary directories on completion or handled errors. Different jobs use separate environments under the plugin checkout's `.state` directory. There is no `pre-exit` hook; environments remain until workspace cleanup removes them. Abrupt process/machine termination can leave temporary directories or siblings; broad pruning is not performed.
-
-| Event | Result |
+| Hook | Action |
 | --- | --- |
-| All candidates missing or incompatible | Successful miss; destinations untouched; no annotation. |
-| Disabled operation, failed command, missing inputs, unchanged save | Successful skip; no cache-error annotation. |
-| Configuration parsing errors or storage configuration rejected with `ValueError` | Fatal hook failure and best-effort annotation. |
-| Other SDK errors, authorization, network, corruption, archive/merge I/O | Log and annotate; continue by default, fail under strict mode. |
-| Candidate error before merge | Normal mode may try another candidate; strict stops immediately. |
-| Error after merge starts | Stop restore; do not merge another candidate. |
-| Annotation failure | Log reporting failure and retain the original result. |
+| `post-checkout` | Prepare the job's Python environment. |
+| `pre-command` | Restore the cache. |
+| `post-command` | Update the stored cache after command success. |
 
-Diagnostics include identity, source/target refs, outcome, transferred bytes, and duration. Error annotations use job-scoped `qdb-cache-restore` and `qdb-cache-save` contexts and stdin bodies. Restore and save errors do not overwrite each other. Command failures themselves are not annotated by the cache plugin.
+A missing cache is normal. Operational errors are logged and annotated; the command continues unless `strict` is enabled.
 
-### Identity and fallback
+### Cache identity and fallback
 
-With destination `s3://ci-cache/buildkite`, pipeline `example`, branch `feature`, and the dimensions above, the object is `s3://ci-cache/buildkite/example/refs/heads/feature/cache/v1/compiler=gcc-14/os=linux/snapshot.tar.zst`.
+With destination `s3://ci-cache/buildkite`, pipeline `example`, branch `feature`, and no additional keys, the object is:
 
-Pairs are sorted case-sensitively by original key. Keys and values are separately URL-encoded so `/`, `=`, and `%` cannot change path structure. Reordering pairs selects the same object; changing a value selects a different namespace. Without pairs, `snapshot.tar.zst` is directly under `cache/v1/`.
+```text
+s3://ci-cache/buildkite/example/refs/heads/feature/cache/v1/snapshot.tar.zst
+```
 
-Identity includes no automatic step, OS, architecture, compiler, dependency digest, or cache name. Pipelines supply dimensions for workload compatibility and independent snapshots. Steps caching different layouts should supply separate `name` values; otherwise they overwrite the same object and fail each other's layout check.
+Use `keys` to separate caches for different steps, operating systems, or toolchains. Tags take precedence over branches.
 
-`BUILDKITE_TAG` takes priority over `BUILDKITE_BRANCH`; tags use `refs/tags/...`, branches use `refs/heads/...`. Pipeline, Git ref, and `BUILDKITE_JOB_ID` are required. Buildkite-provided identifiers are used without additional character or path validation.
+Restore tries the current ref, then master and main. Set `fallback: disabled` to use only the current ref. Saving always updates the current ref's cache.
 
-Restore always tries the current ref first. Default fallback then tries `refs/heads/master` and `refs/heads/main`, omitting the current ref if it is already one of them. Use `fallback: disabled` for only the current ref. Custom fallback branches are unsupported.
+### Snapshots
 
-Fallback retains pipeline, dimensions, and path/exclusion layout. A fallback hit can seed the current branch; save always targets the current ref. No bucket listing or build-history lookup occurs.
+Snapshots preserve working-directory-relative paths, file contents, and permissions. Modification times are excluded from the checksum; unchanged snapshots skip uploading. Regular files and directories are supported; symbolic links are not.
 
-### Snapshots and merge
+Missing inputs or snapshots with no files skip saving. Restore preserves unrelated files. An interrupted restore can leave partially updated files, and concurrent saves can overwrite each other.
 
-Normalized logical roots are sorted and stored as `roots/0000`, `roots/0001`, and so on. Identical basenames in different directories remain distinct. The current configuration maps archive roots to local destinations. A layout SHA-256 covers logical path specifications and exclusions; a changed layout makes an old snapshot incompatible instead of redirecting it.
-
-The tar uses standard `tarfile` traversal and includes file bytes, names/types, permission bits, and modification times. Ownership/user/group names are normalized for stable checksums. Access/creation times, special permission bits, ACLs, and extended attributes are omitted. Hard-linked files become independent regular entries. Included symbolic links are rejected; exclusions can omit them. Restore accepts regular files and directories only.
-
-Extraction checks member paths stay within staging and map to configured roots. Inputs are assumed to be ordinary, stable files; the plugin does not impose additional portable-filename or archive-metadata policies. Dimensions own cross-platform compatibility.
-
-The uncompressed tar's SHA-256 includes restored metadata, so mtime changes can change the checksum. `qdb-cache-format`, `qdb-cache-layout-sha256`, and `qdb-cache-sha256` are stored as user metadata on the same S3/R2 object as `snapshot.tar.zst`, through the upload's `Metadata` argument. There is no separate metadata object. Restore checks format and layout from the GET response; save compares all three fields through HEAD. The checksum identifies unchanged snapshots during save; restore does not verify it. The layout digest prevents positional archive roots from mapping old content into a changed destination layout. ETags are not used as content checksums. Unchanged checks still read local inputs; they save compression/upload traffic.
-
-Restore binds bytes and metadata to one streamed GET response, decompresses with `zstandard`, and validates member paths/types before extracting into staging. Only then does live merge start. Matched files use temporary siblings and `os.replace`; unmatched existing files remain. Destination symlinks are refused; file/directory conflicts surface as filesystem errors during merge. Directory metadata is applied after children. A miss creates no destinations. There is no clean/replacement mode.
-
-Merge is not transactional across files or roots. A file/directory conflict, permission error, disk failure, or interruption after installation starts can leave earlier files updated. Per-file replacement does not provide rollback. Merge can retain stale files absent from the snapshot.
-
-Save requires `BUILDKITE_COMMAND_EXIT_STATUS` to equal `0`. Failed or missing status skips publication. Any missing root skips the whole snapshot before resolving credentials. Fully excluded payloads also skip; a naturally empty configured directory is valid. Keep inputs stable during capture; it is not a filesystem-wide atomic snapshot.
-
-Save compares only the current ref's metadata. Matching format, layout and content digest skip compression/upload unless forced; missing/mismatched metadata causes upload. Force does not override failed commands, missing inputs, exclusions, or validation errors.
-
-Each identity has one current object. Concurrent jobs use ordinary backend overwrite behavior without locks or build-number ordering. An older build can overwrite a newer build; changes can be lost. A lost upload response can mean a complete replacement committed despite the reported client error. Bucket versioning and retention are external.
-
-### Capacity and reset
-
-Snapshots read all included inputs. Provision scratch for the uncompressed tar, compressed object, and staged content in addition to live data. There is no arbitrary cache-size limit or measured throughput/capacity claim.
-
-Externally deleting the selected object gives a cold cache. Changing dimensions selects another namespace; force refreshes the existing identity. `cache/v1` starts cold, with no migration from artifact/test-report objects or upstream cache keys. The plugin manages neither history nor pruning.
+Older snapshots with a different path layout are skipped and refreshed on the next save.
 
 ## Backend configuration
 
-Storage must already exist and be configured through SSM or environment overrides. An S3 agent using its IAM role can supply:
+Storage uses the configuration from `qdb-artifacts-buildkite-plugin`. Environment overrides take precedence over SSM parameters. SSM uses `AWS_DEFAULT_REGION`, defaulting to `eu-west-1`.
+
+An S3 agent using its IAM role can supply:
 
 ```yaml
 env:
@@ -158,30 +116,15 @@ env:
   AWS_DEFAULT_REGION: eu-west-1
 ```
 
-Example bucket names describe configuration, not provisioned infrastructure. The plugin creates neither buckets nor credentials. An omitted optional `ARTIFACTS_DOMAIN` still triggers an inherited SSM lookup; environment-configured storage does not inherently remove the AWS/SSM dependency.
-
-Precedence is a nonempty environment override, then the matching SSM parameter, then an inherited default where one exists. SSM uses `AWS_DEFAULT_REGION`, defaulting to `eu-west-1`.
-
-| Environment variable | SSM parameter | Behavior |
+| Environment variable | SSM parameter | Meaning |
 | --- | --- | --- |
 | `ARTIFACTS_BACKEND` | `/services/buildkite/config/artifacts/object-store/backend` | `s3` or `r2`; defaults to `s3`. |
-| `ARTIFACTS_DESTINATION` | `/services/buildkite/config/artifacts/object-store/destination` | Required `s3://bucket/prefix` or legacy plain bucket. R2 also uses the S3 URI form. |
-| `ARTIFACTS_ENDPOINT_URL` | `/services/buildkite/config/artifacts/object-store/endpoint-url` | Explicit endpoint override. SSM endpoint fallback is consulted for R2; S3 uses only the environment override. |
-| `ARTIFACTS_R2_ACCOUNT_ID` | `/services/buildkite/config/artifacts/object-store/r2/account-id` | Required for R2; derives the endpoint if no override is supplied. |
-| `ARTIFACTS_R2_ACCESS_KEY_ID` | `/services/buildkite/config/artifacts/object-store/r2/access-key-id` | Required R2 access key ID. |
-| `ARTIFACTS_R2_SECRET_ACCESS_KEY` | `/services/buildkite/credentials/artifacts/r2/secret-access-key` | Required R2 secret; SSM is read with decryption. |
-| `ARTIFACTS_DOMAIN` | `/services/buildkite/config/artifacts/object-store/r2/artifacts-domain` | Inherited optional lookup; caches do not generate public URLs. |
+| `ARTIFACTS_DESTINATION` | `/services/buildkite/config/artifacts/object-store/destination` | Required `s3://bucket/prefix` or plain bucket name. |
+| `ARTIFACTS_ENDPOINT_URL` | `/services/buildkite/config/artifacts/object-store/endpoint-url` | Optional endpoint override; SSM fallback applies to R2 only. |
+| `ARTIFACTS_R2_ACCOUNT_ID` | `/services/buildkite/config/artifacts/object-store/r2/account-id` | R2 account ID, used to derive its default endpoint. |
+| `ARTIFACTS_R2_ACCESS_KEY_ID` | `/services/buildkite/config/artifacts/object-store/r2/access-key-id` | R2 access key ID. |
+| `ARTIFACTS_R2_SECRET_ACCESS_KEY` | `/services/buildkite/credentials/artifacts/r2/secret-access-key` | R2 secret access key, decrypted when read from SSM. |
 
-S3 uses boto3's normal AWS credential chain, typically the agent IAM role. R2 uses stored S3-compatible credentials, `s3v4` signatures, path-style addressing, region `auto`, and a default endpoint of `https://<account-id>.r2.cloudflarestorage.com`. Placeholder R2 settings are rejected. There is no standalone-R2 mode that bypasses inherited AWS/SSM resolution.
+S3 uses the agent's normal AWS credentials. R2 requires its account ID and access keys. SSM access requires `ssm:GetParameter` and applicable `kms:Decrypt` permissions.
 
-SSM reads require `ssm:GetParameter` for consulted parameters and `kms:Decrypt` where applicable. An environment override skips its own lookup; omitted optional settings can still require SSM. Missing parameters and failed authorization/network requests are distinguished.
-
-Restore requires object-read access (`s3:GetObject` on S3). Save reads metadata with HEAD and uses boto3's multipart-capable upload manager, requiring object-write and applicable multipart permissions. The plugin does not list buckets or delete objects. Scope credentials to the intended destination; configure lifecycle expiration for unfinished multipart uploads and inactive snapshots externally.
-
-## Debug mode
-
-Set `debug: true` in the plugin configuration to enable inherited Bash tracing around hook execution.
-
-```yaml
-debug: true
-```
+S3 requires `s3:GetObject`, `s3:ListBucket` to distinguish missing objects from access denial, and object-write/multipart permissions for saving. The plugin creates neither buckets nor credentials.

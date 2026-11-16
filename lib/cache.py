@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,10 +50,7 @@ def annotate(operation: str, identity: str, messages: list[str], fatal: bool) ->
 
 
 def _stage_snapshot(config: CacheConfig, response: dict, tmp_dir: Path, result: dict):
-    # Prepare a snapshot before any live files change:
-    # 1. Download and decompress into tmp_dir.
-    # 2. Validate the archive layout.
-    # 3. Extract validated members into staging.
+    """Download, validate, and stage a compatible snapshot before live files change."""
     metadata = response.get("Metadata", {})
     if (
         metadata.get("qdb-cache-format") != CACHE_FORMAT_VERSION
@@ -68,21 +64,20 @@ def _stage_snapshot(config: CacheConfig, response: dict, tmp_dir: Path, result: 
             # Failed candidates still contribute to the transferred-byte total.
             result["bytes"] += len(chunk)
     tar_path = tmp_dir / "snapshot.tar"
-    with compressed.open("rb") as data, tar_path.open("wb") as output:
-        with zstandard.ZstdDecompressor().stream_reader(data) as reader:
-            shutil.copyfileobj(reader, output, archive.BLOCK)
+    archive.decompress_snapshot(compressed, tar_path)
     staging = tmp_dir / "staging"
-    members = archive.validate_tar(tar_path, config.roots, staging)
+    members = archive.validate_tar(tar_path, config.roots)
     archive.extract_staged(tar_path, staging, members)
     return staging, members
 
 
 def restore(config: CacheConfig, tmp_dir: Path) -> dict:
+    """Restore the current ref or a fallback, stopping once live installation starts."""
     try:
         client, bucket, prefix = object_store.open_store(config)
     except ValueError as exc:
         return {"outcome": "configuration error", "fatal": True, "errors": [str(exc)]}
-    result = {"outcome": "miss", "errors": [], "events": [], "bytes": 0}
+    result = {"outcome": "miss", "errors": [], "bytes": 0}
     try:
         for index, ref in enumerate(config.fallback_refs):
             key = config.object_key(prefix, ref)
@@ -92,11 +87,11 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
             try:
                 response = object_store.get_snapshot(client, bucket, key)
                 if response is None:
-                    result["events"].append(f"missing ref={ref!r}")
+                    log(f"missing ref={ref!r}")
                     continue
                 prepared = _stage_snapshot(config, response, candidate_tmp_dir, result)
                 if prepared is None:
-                    result["events"].append(f"incompatible ref={ref!r}")
+                    log(f"incompatible ref={ref!r}")
                     continue
             except Exception as exc:
                 result["errors"].append(f"ref={ref!r}: {exc}")
@@ -109,14 +104,14 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
                     response["Body"].close()
             staging, members = prepared
             try:
-                archive.merge_staged(staging, config.roots, members)
+                archive.merge_staged(staging, config.working_dir, members)
             except Exception as exc:
                 # Installing cached files preserves unrelated live files but can stop
                 # partway; another candidate cannot safely repair a partial merge.
                 result["errors"].append(f"merge ref={ref!r}: {exc}")
                 result["outcome"] = "error"
                 return result
-            result["events"].append(f"restored source-ref={ref!r} target-ref={config.git_ref!r}")
+            log(f"restored source-ref={ref!r} target-ref={config.git_ref!r}")
             result["outcome"] = "restored"
             return result
         return result
@@ -125,12 +120,9 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
 
 
 def save(config: CacheConfig, tmp_dir: Path) -> dict:
-    # This function is responsible for publishing a snapshot. It works by:
-    # 1. Capturing inputs and their checksum in the caller-owned temporary directory.
-    # 2. Comparing metadata to avoid unnecessary compression and uploads.
-    # 3. Compressing and uploading changed content to the current ref.
+    """Publish changed cached files to the current ref's stored snapshot."""
     tar_path = tmp_dir / "snapshot.tar"
-    digest = archive.create_tar(config.roots, config.exclusions, tar_path)
+    digest = archive.create_tar(config.working_dir, config.roots, config.exclusions, tar_path)
     if digest is None:
         return {"outcome": "skipped: missing inputs or no payload", "bytes": 0}
     # Format/layout gate restore compatibility; the digest identifies unchanged
@@ -146,11 +138,9 @@ def save(config: CacheConfig, tmp_dir: Path) -> dict:
         return {"outcome": "configuration error", "fatal": True, "errors": [str(exc)]}
     try:
         key = config.object_key(prefix)
-        existing = object_store.head_snapshot(client, bucket, key)
-        if (
-            not config.force
-            and existing is not None
-            and all(existing.get(name) == value for name, value in metadata.items())
+        existing = None if config.force else object_store.head_snapshot(client, bucket, key)
+        if existing is not None and all(
+            existing.get(name) == value for name, value in metadata.items()
         ):
             return {"outcome": "unchanged", "bytes": 0}
         compressed = tmp_dir / "snapshot.tar.zst"
@@ -164,11 +154,7 @@ def save(config: CacheConfig, tmp_dir: Path) -> dict:
 
 
 def run(operation: str) -> int:
-    # This function is responsible for applying hook failure policy. It works by:
-    # 1. Validating configuration before any storage access.
-    # 2. Skipping disabled operations and saves without command success.
-    # 3. Dispatching the operation with automatically cleaned temporary scratch.
-    # 4. Reporting errors, failing configuration errors and strict-mode operations.
+    """Validate configuration, dispatch operations, and report its result."""
     try:
         config = load_config()
     except (KeyError, ValueError, OSError, RuntimeError) as exc:
@@ -196,8 +182,6 @@ def run(operation: str) -> int:
         result = {"outcome": "error", "errors": [str(exc)]}
     errors = result.get("errors", [])
     fatal = bool(result.get("fatal") or (errors and config.strict))
-    for event in result.get("events", []):
-        log(event)
     log(
         f"{operation} outcome={result['outcome']!r} identity={config.identity!r} "
         f"target-ref={config.git_ref!r} bytes={result.get('bytes', 'unknown')} "

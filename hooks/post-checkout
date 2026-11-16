@@ -9,6 +9,7 @@ if [[ "$(plugin_read_config DEBUG false)" =~ ^(true|on|1)$ ]]; then
 fi
 
 # Pre-flight: verify Python 3 is available on the host agent.
+PYTHON3_CMD="$(_find_python3)"
 if [[ -z "${PYTHON3_CMD}" ]]; then
   echo "+++ :rotating_light: qdb-cache plugin requires python3 on the host agent"
   echo "Install Python 3 on this agent or add it to the AMI via Packer."
@@ -27,4 +28,3 @@ echo "~~~ :python: Setting up qdb-cache plugin"
 "${VENV_BIN}/python" -m pip install --quiet \
   --retries 3 --resume-retries 3 \
   -r "${REQUIREMENTS}"
-

@@ -1,5 +1,5 @@
 name: QDB Cache
-description: Restore and refresh branch-scoped file snapshots in S3 or Cloudflare R2
+description: Restore and refresh file snapshots in S3 compatible storage
 author: https://github.com/bureau14
 requirements:
   - bash
@@ -10,7 +10,7 @@ configuration:
     - path
   properties:
     path:
-      description: Literal files or directories combined into one snapshot
+      description: Files or directories combined into one snapshot
       oneOf:
         - type: string
           minLength: 1

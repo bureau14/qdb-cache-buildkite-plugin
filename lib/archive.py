@@ -5,22 +5,21 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import os
-import posixpath
 import shutil
 import tarfile
 import tempfile
 from functools import partial
 from pathlib import Path
 
-from plugin_config import CacheRoot
+import zstandard
 
 BLOCK = 1024 * 1024
 
 
-def _include_member(member, root: CacheRoot, exclusions: tuple[str, ...]):
-    relative = member.name[len(root.archive_name) :].lstrip("/")
-    path = root.destination / relative
-    pattern = relative or (root.destination.name if not member.isdir() else "")
+def _include_member(member, root: Path, working_dir: Path, exclusions: tuple[str, ...]):
+    relative = Path(member.name).relative_to(root)
+    path = working_dir / member.name
+    pattern = relative.as_posix() if relative.parts else (root.name if not member.isdir() else "")
     if pattern and any(fnmatch.fnmatchcase(pattern, p) for p in exclusions):
         return None
     if path.is_symlink() or not (member.isreg() or member.isdir()):
@@ -28,28 +27,28 @@ def _include_member(member, root: CacheRoot, exclusions: tuple[str, ...]):
     # Ownership varies between agents and must not change the checksum.
     member.uid = member.gid = 0
     member.uname = member.gname = ""
+    # Touching files or recreating directories must not change the cache checksum.
+    member.mtime = 0
     member.mode &= 0o777
     return member
 
 
-def create_tar(roots: tuple[CacheRoot, ...], exclusions: tuple[str, ...], output: Path):
-    if any(not root.destination.exists() for root in roots):
+def create_tar(
+    working_dir: Path, roots: tuple[Path, ...], exclusions: tuple[str, ...], output: Path
+):
+    """Capture working-directory paths with stable metadata for checksum comparison."""
+    if any(not (working_dir / root).exists() for root in roots):
         return None
-    payload = False
     with tarfile.open(output, "w", format=tarfile.PAX_FORMAT, dereference=True) as tar:
         for root in roots:
-            start = len(tar.members)
             tar.add(
-                root.destination,
-                arcname=root.archive_name,
-                filter=partial(_include_member, root=root, exclusions=exclusions),
+                working_dir / root,
+                arcname=root.as_posix(),
+                filter=partial(
+                    _include_member, root=root, working_dir=working_dir, exclusions=exclusions
+                ),
             )
-            for member in tar.members[start:]:
-                relative = member.name[len(root.archive_name) :].lstrip("/")
-                # Naturally empty directories are payload; fully excluded trees are not.
-                payload = (
-                    payload or member.isreg() or not any((root.destination / relative).iterdir())
-                )
+        payload = any(member.isreg() for member in tar.members)
     return sha256_file(output) if payload else None
 
 
@@ -61,28 +60,33 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _assert_tar_path_is_safe(out, name):
-    if not Path(name).parts or ".." in Path(name).parts:
-        raise tarfile.TarError(f"refusing unsafe tar member path: {name}")
-    if posixpath.isabs(name):
-        raise tarfile.TarError(f"refusing absolute tar member path: {name}")
+def decompress_snapshot(compressed: Path, output: Path) -> None:
+    decoder = zstandard.ZstdDecompressor().decompressobj()
+    with compressed.open("rb") as data, output.open("wb") as destination:
+        # The incremental API exposes frame completion but returns all output per
+        # input chunk; small reads bound allocations for highly compressed caches.
+        for chunk in iter(lambda: data.read(1024), b""):
+            while chunk:
+                if decoder.eof:
+                    decoder = zstandard.ZstdDecompressor().decompressobj()
+                destination.write(decoder.decompress(chunk))
+                chunk = decoder.unused_data
+        if not decoder.eof:
+            raise zstandard.ZstdError("incomplete compressed snapshot")
 
-    out = out.resolve()
-    if not (out / name).resolve().is_relative_to(out):
-        raise tarfile.TarError(f"refusing tar member outside output dir: {name}")
 
-
-def validate_tar(tar_path: Path, roots: tuple[CacheRoot, ...], staging: Path):
-    expected = {root.archive_name for root in roots}
+def validate_tar(tar_path: Path, roots: tuple[Path, ...]):
+    """Accept regular files and directories within the configured relative paths."""
     members = {}
     with tarfile.open(tar_path, "r:") as tar:
         for member in tar:
-            if "/".join(member.name.split("/")[:2]) not in expected:
-                raise tarfile.TarError(f"unexpected archive root: {member.name!r}")
+            path = Path(member.name)
+            if not member.name or path.anchor or ".." in path.parts:
+                raise tarfile.TarError(f"unsafe tar member path: {member.name!r}")
+            if not any(path.is_relative_to(root) for root in roots):
+                raise tarfile.TarError(f"unexpected archive path: {member.name!r}")
             if not (member.isdir() or member.isreg()):
                 raise tarfile.TarError(f"unsupported tar entry: {member.name!r}")
-            # extractfile() supplies bytes; our manual writes need their own path boundary.
-            _assert_tar_path_is_safe(staging, member.name)
             members[member.name] = member
     if not members:
         raise tarfile.TarError("snapshot contains no roots")
@@ -103,30 +107,11 @@ def extract_staged(tar_path: Path, staging: Path, members: dict[str, tarfile.Tar
                     shutil.copyfileobj(data, output, BLOCK)
 
 
-def _live_path(name: str, roots: tuple[CacheRoot, ...]) -> Path:
-    parts = name.split("/", 2)
-    root = next(root for root in roots if root.archive_name == "/".join(parts[:2]))
-    if root.destination.is_symlink():
-        raise tarfile.TarError(f"refusing destination symlink: {str(root.destination)!r}")
-    path = root.destination
-    if len(parts) == 3:
-        _assert_tar_path_is_safe(path, parts[2])
-        path = path / parts[2]
-    if path.is_symlink():
-        raise tarfile.TarError(f"refusing destination symlink: {str(path)!r}")
-    return path
-
-
-def _restore_metadata(path: Path, mode: int, mtime: float) -> None:
-    # Temporary-file replacement loses executable bits; changed mtimes also alter
-    # the tar digest used to skip unchanged uploads.
-    os.chmod(path, mode & 0o777)
-    os.utime(path, (mtime, mtime))
-
-
-def merge_staged(staging: Path, roots: tuple[CacheRoot, ...], members) -> None:
-    entries = [(name, member, _live_path(name, roots)) for name, member in sorted(members.items())]
-    for name, member, path in entries:
+def merge_staged(staging: Path, working_dir: Path, members) -> None:
+    """Restore staged files to a clean checkout, applying directory modes last."""
+    entries = sorted(members.items())
+    for name, member in entries:
+        path = working_dir / name
         path.parent.mkdir(parents=True, exist_ok=True)
         if member.isdir():
             path.mkdir(exist_ok=True)
@@ -138,11 +123,12 @@ def merge_staged(staging: Path, roots: tuple[CacheRoot, ...], members) -> None:
             temporary = Path(data.name)
         try:
             shutil.copyfile(staging / name, temporary)
-            _restore_metadata(temporary, member.mode, member.mtime)
+            # Temporary files start at 0600; retain cached executable/access bits.
+            os.chmod(temporary, member.mode & 0o777)
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
-    # Apply directory metadata last so read-only modes do not block child writes.
-    for _, member, path in reversed(entries):
+    # Apply directory modes last so read-only modes do not block child writes.
+    for name, member in reversed(entries):
         if member.isdir():
-            _restore_metadata(path, member.mode, member.mtime)
+            os.chmod(working_dir / name, member.mode & 0o777)

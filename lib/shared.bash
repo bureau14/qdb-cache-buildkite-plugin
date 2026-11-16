@@ -40,8 +40,6 @@ _find_python3() {
   fi
 }
 
-PYTHON3_CMD="$(_find_python3)"
-
 # Venv layout differs between platforms:
 #   Linux/macOS: .venv/bin/python3, .venv/bin/pip
 #   Windows:     .venv/Scripts/python.exe, .venv/Scripts/pip.exe
@@ -57,22 +55,6 @@ plugin_read_config() {
   echo "${!var:-$default}"
 }
 
-plugin_read_list() {
-  local prefix="BUILDKITE_PLUGIN_${PLUGIN_PREFIX}_${1}"
-  local i=0
-  local parameter="${prefix}_${i}"
-  if [[ -n "${!parameter:-}" ]]; then
-    while [[ -n "${!parameter:-}" ]]; do
-      echo "${!parameter}"
-      i=$((i+1))
-      parameter="${prefix}_${i}"
-    done
-  elif [[ -n "${!prefix:-}" ]]; then
-    echo "${!prefix}"
-  fi
-}
-
 run_cache_py() {
   "${VENV_BIN}/python" "${CACHE_PY}" "$@"
 }
-

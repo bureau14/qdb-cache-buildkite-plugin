@@ -8,13 +8,15 @@ STATE_DIR="${PLUGIN_DIR}/.state/${BUILDKITE_JOB_ID:-}"
 VENV_DIR="${STATE_DIR}/.venv"
 CACHE_PY="${PLUGIN_DIR}/lib/cache.py"
 
-# Detect Python 3.
+# Detect Python 3.9+.
 #   Linux/macOS: "python3" is on PATH.
 #   Windows:     Packer installs Python to C:\Python<ver>-<bits>\ which may not
 #                be on PATH. We search known locations as a fallback.
 _find_python3() {
   # 1. Agent-provided path (set by packer via QDB_CICD_AGENT_PYTHON3)
-  if [[ -n "${QDB_CICD_AGENT_PYTHON3:-}" ]] && [[ -x "${QDB_CICD_AGENT_PYTHON3}" ]]; then
+  if [[ -n "${QDB_CICD_AGENT_PYTHON3:-}" ]] \
+     && [[ -x "${QDB_CICD_AGENT_PYTHON3}" ]] \
+     && "${QDB_CICD_AGENT_PYTHON3}" -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)" 2>/dev/null; then
     echo "${QDB_CICD_AGENT_PYTHON3}"
     return
   fi
@@ -22,7 +24,7 @@ _find_python3() {
   # 2. Try standard commands on PATH
   for cmd in python3 python; do
     if command -v "$cmd" &>/dev/null \
-       && "$cmd" -c "import sys; sys.exit(0 if sys.version_info >= (3,) else 1)" 2>/dev/null; then
+       && "$cmd" -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)" 2>/dev/null; then
       echo "$cmd"
       return
     fi
@@ -32,7 +34,7 @@ _find_python3() {
   if [[ -n "${SYSTEMROOT:-}" ]]; then
     for dir in /c/Python3.*-64 /c/Python3.*-32 /c/Python3*; do
       if [[ -x "${dir}/python.exe" ]] \
-         && "${dir}/python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3,) else 1)" 2>/dev/null; then
+         && "${dir}/python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)" 2>/dev/null; then
         echo "${dir}/python.exe"
         return
       fi

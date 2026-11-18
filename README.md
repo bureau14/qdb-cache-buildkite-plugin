@@ -4,7 +4,7 @@ Caches files and directories from the working directory in AWS S3 or Cloudflare 
 
 ## Requirements
 
-Bash and Python 3 must be available on the host agent. Storage access must be configured as described in [Backend configuration](#backend-configuration).
+Bash and Python 3.9+ must be available on the host agent. Storage access must be configured as described in [Backend configuration](#backend-configuration).
 
 ## Usage
 

@@ -11,7 +11,6 @@ import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import ClientError
-
 from plugin_config import CacheConfig
 
 BACKEND_SSM_PARAM = "/services/buildkite/config/artifacts/object-store/backend"
@@ -199,8 +198,28 @@ def aws_clients(operation: CacheConfig):
     return session.client("ssm", config=sdk_config(operation, region_name=region_name))
 
 
+class LazySsmClient:
+    """Create SSM client only if config resolution actually needs SSM."""
+
+    def __init__(self, operation: CacheConfig):
+        self._operation = operation
+        self._client = None
+
+    def _ensure_client(self):
+        if self._client is None:
+            self._client = aws_clients(self._operation)
+        return self._client
+
+    def get_parameter(self, *args, **kwargs):
+        return self._ensure_client().get_parameter(*args, **kwargs)
+
+    def close(self):
+        if self._client is not None:
+            self._client.close()
+
+
 def open_store(operation: CacheConfig):
-    ssm = aws_clients(operation)
+    ssm = LazySsmClient(operation)
     try:
         cfg = load_store_config(ssm)
         bucket, prefix = parse_s3(cfg.destination)

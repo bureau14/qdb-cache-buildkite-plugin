@@ -107,6 +107,8 @@ With `git-ref: false`, branches and tags share one cache. For example, with no k
 
 A snapshot stores files individually and records their paths, permissions, and checksums in a manifest. It includes empty directories. Saving skips symlinks and uploads only file contents missing from the previous compatible snapshot. Once all uploads succeed, the plugin publishes the manifest if another writer hasn’t changed it. A competing save that loses this race skips publication.
 
+Each configured path is optional at save time. If one is missing, the plugin saves the remaining eligible files and directories and drops the missing path's entries from the new snapshot. If every path is missing or excluded, it skips the save and preserves the previous snapshot. An error reading an input aborts publication.
+
 Restore reuses matching local files and verifies each download’s size and SHA-256 checksum before changing the cache. By default, it removes stale files and preserves exclusions. If all refs miss, it clears eligible local contents. Set `clear: false` to keep extra local files on both hits and misses.
 
 Cache files must have a single hard link. Restore rejects symlinked destinations and ambiguous filenames. A failed download or corrupt snapshot leaves local files intact while restore tries the next ref. With `strict: true`, the first error stops restore. A filesystem error during installation can leave a partial restore.

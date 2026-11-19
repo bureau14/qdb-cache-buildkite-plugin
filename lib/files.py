@@ -108,22 +108,17 @@ def _excluded(relative: Path, root: Path, kind: str, patterns: tuple[str, ...]) 
 
 
 def select_inputs(config: CacheConfig) -> list[SourceEntry]:
-    """Check required roots first, then walk each selection under its own exclusions."""
+    """Walk the available roots under their exclusions and validate the combined selection."""
     _check_mounts(config)
-    selected = []
+    entries = []
     for wire, root in config.root_paths.items():
         try:
-            info = _inspect(root)
+            root_info = _inspect(root)
         except _Symlink:
             continue
-        except NotADirectoryError:
-            return []
-        if info is None:
-            return []
-        selected.append((wire, root, info))
+        if root_info is None:
+            continue
 
-    entries = []
-    for wire, root, root_info in selected:
         pending = [(root, root_info)]
         while pending:
             source, info = pending.pop()

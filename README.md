@@ -19,6 +19,7 @@ steps:
           path:
             - build/Testing/Temporary/CTestCostData.txt
             - .cache
+            - ~/.m2/repository
           keys:
             - key: os
               value: linux
@@ -50,10 +51,11 @@ plugins:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `path` | Required | Checkout-relative file or directory, or a nonempty list of disjoint paths. Use forward slashes for paths shared across platforms. Each agent resolves them under its own checkout. Duplicate roots, nested roots, absolute paths, home-relative paths, drive-qualified paths, and parent traversal are rejected. |
+| `path` | Required | File or directory, or a nonempty list of disjoint paths. A relative path starts at the job checkout, `~/` starts at the agent user's home, and an absolute path selects that local location. Use forward slashes for portable configurations. Duplicate or overlapping roots, drive-relative paths, and parent traversal are rejected. |
 | `keys` | Empty list | Key/value pairs selecting an independent cache. Keys must be nonempty and unique; values are strings and may be empty. |
 | `git-ref` | `true` | Include the Git ref in cache identity. Disable to share a cache across branches and tags. |
 | `restore` | `true` | Restore before the command. |
+| `clear` | `true` | Remove eligible local files absent from a verified snapshot. If all refs miss, clear eligible contents of the configured roots. Set to `false` to preserve extra local files on a hit or miss. Applies when restore is enabled. |
 | `save` | `true` | Create or update the stored cache after a successful command. |
 | `fallback` | `default` | Try master then main after the current ref, or use `disabled` for only the current ref. |
 | `exclude` | Empty list | Case-sensitive glob pattern or list of patterns relative to each cached directory; a file path uses its basename. |
@@ -64,7 +66,7 @@ plugins:
 | `read-timeout` | `60` | Positive finite read timeout in seconds for storage and SSM requests. |
 | `debug` | `false` | Enable Bash tracing. |
 
-Give each job exclusive use of its checkout and writable cache destinations through restore and build. Keep the plugin’s shared `.state` directory and the checkout in disjoint trees. The checkout itself may be a mount point. Provision it without an alias of private state at its root. A configured path cannot cross a mount below the checkout or contain a nested mount.
+Give each job exclusive use of its checkout and writable cache destinations through restore and build, including home-relative caches on shared agents. Keep the checkout disjoint from the plugin’s shared `.state` directory and cache roots separate from the plugin installation. Provision mounted checkouts without aliases of private state. A configured cache directory cannot contain a mount or cross a mount below the checkout. The checkout itself may be mounted. With clearing enabled, select individual cache directories or files. Selecting the whole checkout, home, or their ancestors for clearing fails configuration.
 
 Timeouts and retries apply per SDK request. If a payload download is interrupted after the response starts, the plugin makes one more GET for the same object key and restarts the download. Each of the two GET requests can use the configured SDK attempts.
 
@@ -103,19 +105,15 @@ With `git-ref: false`, branches and tags share one cache. For example, with no k
 
 ### Snapshots
 
-The manifest records the configured roots, exclusions, file and directory permissions, and a SHA-256 digest, byte length, and storage generation for each file. Each entry has one checkout-relative path. For example, `path: .cache` saves from the producing checkout and restores into the consuming checkout’s own `.cache` directory. Empty directories are included. Saving skips symlinks and inputs with symlinked ancestors. Missing required inputs or an entirely ineligible selection skip the save before backend configuration is needed.
+A snapshot stores files individually and records their paths, permissions, and checksums in a manifest. It includes empty directories. Saving skips symlinks and uploads only file contents missing from the previous compatible snapshot. Once all uploads succeed, the plugin publishes the manifest if another writer hasn’t changed it. A competing save that loses this race skips publication.
 
-On save, the plugin hashes each file. If its digest and size occur in the previous compatible manifest, the new snapshot reuses that file's object key without a storage request for the payload. For each new digest, the plugin verifies a private copy and uploads it under `objects/<generation>/<sha256>` beside the manifest. Each writer uses a fresh generation for its uploads. A permission change, rename within a cached directory, or file removal can update the manifest without uploading payloads.
+Restore reuses matching local files and verifies each download’s size and SHA-256 checksum before changing the cache. By default, it removes stale files and preserves exclusions. If all refs miss, it clears eligible local contents. Set `clear: false` to keep extra local files on both hits and misses.
 
-Once all uploads succeed, the plugin publishes the manifest with one unconditional write. The last successful write wins, even if it comes from an older build. A reader finishes from the manifest it fetched. An upload failure leaves the previous manifest in place. If the store fails to confirm a manifest write, the hook reports an operational error.
-
-Restore merges a compatible snapshot into the configured roots, preserving excluded and unrelated files. A different format or root/exclusion layout is a cache miss, including in strict mode. A miss leaves local files in place. Files with matching bytes avoid a download, including when only their permissions differ. Missing, different, or unreadable files are fetched and verified against the manifest's byte lengths and SHA-256 digests. Cache files must have a single hard link. A hard-linked input or matching destination path raises an operational error before publication or installation.
-
-Save and restore reject sibling names that coincide under case folding or Unicode normalization, including implicit parent directories. Restore also checks the spelling of existing destination names, rejects traversal and symlinked destinations, and stages all required payloads before installing any of them. A corrupt snapshot, failed transfer, or denied request leaves local files intact while restore tries fallback refs. Strict mode stops on the first error. Once installation starts, a local filesystem error can leave a partial restore and ends fallback.
+Cache files must have a single hard link. Restore rejects symlinked destinations and ambiguous filenames. A failed download or corrupt snapshot leaves local files intact while restore tries the next ref. With `strict: true`, the first error stops restore. A filesystem error during installation can leave a partial restore.
 
 ### Rollout and retention
 
-The `files-v3/` namespace starts cold. The first successful save seeds it. Rolling back the plugin selects the earlier namespace. Before upgrading, check consuming pipelines for absolute, home-relative, overlapping, or mounted paths. Confirm that jobs sharing a cache key can accept publication in completion order and that bucket policies allow unconditional manifest writes.
+Existing checkout-only snapshots in `files-v3/` remain readable. Before upgrading, set `clear: false` in steps that depend on local files surviving a cache miss or a restore from a smaller snapshot. When jobs share an identity, upgrade all writers so that each uses conditional publication. Check bucket policies allow conditional manifest writes.
 
 Keep completed payloads outside age-based expiration rules. A newly published manifest may reference an old generation because reusing a payload leaves its age unchanged. For the example identity without keys, check whether your lifecycle rules match `buildkite/example/refs/heads/feature/cache/files-v3/objects/<generation>/<sha256>`. A bucket-wide rule or a rule on the shared `buildkite/` prefix also applies. Incomplete multipart uploads can expire independently. [S3 lifecycle rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html) · [R2 object lifecycles](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)
 
@@ -147,4 +145,4 @@ S3 uses the agent's normal AWS credentials. R2 requires its account ID and acces
 
 S3 requires `s3:GetObject` and `s3:ListBucket` to read objects and distinguish missing keys from access denial. Saving also requires `s3:PutObject` and `s3:AbortMultipartUpload`. For buckets using SSE-KMS, allow `kms:Decrypt` for reads and multipart uploads, and `kms:GenerateDataKey` for writes. [S3 multipart permissions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html#mpuAndPermissions)
 
-For R2, grant bucket-scoped Object Read access for restore and Object Read & Write for save. Bucket policies must allow unconditional manifest writes, payload uploads, and multipart completion and abort.
+For R2, grant bucket-scoped Object Read access for restore and Object Read & Write for save. Bucket policies must allow conditional manifest writes, payload uploads, and multipart completion and abort.

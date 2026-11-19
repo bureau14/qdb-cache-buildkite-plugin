@@ -18,9 +18,10 @@ from pathlib import Path
 from plugin_config import (
     CACHE_FORMAT_VERSION,
     CacheConfig,
+    CacheRootError,
+    check_root_spellings,
     name_key,
     normalize_path,
-    normalize_roots,
     reserved_windows_component,
 )
 
@@ -28,7 +29,13 @@ BLOCK = 1024 * 1024
 
 
 def layout(config: CacheConfig) -> dict:
-    return {"paths": [p.as_posix() for p in config.roots], "exclude": list(config.exclusions)}
+    header = {
+        "paths": [p.as_posix() for p in config.root_paths],
+        "exclude": list(config.exclusions),
+    }
+    if config.external_layout:
+        header["root_specs"] = list(config.external_layout)
+    return header
 
 
 class _Symlink(ValueError):
@@ -104,8 +111,7 @@ def select_inputs(config: CacheConfig) -> list[SourceEntry]:
     """Check required roots first, then walk each selection under its own exclusions."""
     _check_mounts(config)
     selected = []
-    for relative in config.roots:
-        root = config.working_dir / relative
+    for wire, root in config.root_paths.items():
         try:
             info = _inspect(root)
         except _Symlink:
@@ -114,10 +120,10 @@ def select_inputs(config: CacheConfig) -> list[SourceEntry]:
             return []
         if info is None:
             return []
-        selected.append((root, info))
+        selected.append((wire, root, info))
 
     entries = []
-    for root, root_info in selected:
+    for wire, root, root_info in selected:
         pending = [(root, root_info)]
         while pending:
             source, info = pending.pop()
@@ -126,7 +132,7 @@ def select_inputs(config: CacheConfig) -> list[SourceEntry]:
             kind = "directory" if stat.S_ISDIR(info.st_mode) else "file"
             if _excluded(source.relative_to(root), root, kind, config.exclusions):
                 continue
-            relative = source.relative_to(config.working_dir)
+            relative = wire / source.relative_to(root)
             _wire_path(relative.as_posix())
             entries.append(SourceEntry(relative, source, _kind(info, source), info.st_mode & 0o777))
             if kind == "directory":
@@ -166,9 +172,19 @@ def _validated_entries(manifest: dict, config: CacheConfig) -> dict | None:
         or not all(isinstance(p, str) for p in recorded["exclude"])
     ):
         raise ValueError("invalid cache manifest layout")
-    roots = normalize_roots(tuple(recorded["paths"]))
+    roots = tuple(map(normalize_path, recorded["paths"]))
+    check_root_spellings(roots)
     if {p.as_posix() for p in roots} != set(recorded["paths"]):
         raise ValueError("invalid cache manifest root spelling")
+    if "root_specs" in recorded:
+        specs = recorded["root_specs"]
+        if (
+            not isinstance(specs, list)
+            or not all(isinstance(s, str) and s for s in specs)
+            or specs != sorted(set(specs))
+            or recorded["paths"] != [str(i) for i in range(len(specs))]
+        ):
+            raise ValueError("invalid cache manifest root specifications")
     if recorded != layout(config):
         return None
     records = manifest.get("entries")
@@ -193,7 +209,9 @@ def _wire_path(raw: str) -> Path:
     return path
 
 
-def _entry_path(entry: dict, roots: set[str], patterns: tuple[str, ...]) -> tuple[Path, Path]:
+def _entry_path(
+    entry: dict, roots: dict[str, Path], patterns: tuple[str, ...]
+) -> tuple[Path, Path]:
     """Validate file metadata, then locate the owning root to enforce its exclusions."""
     if not isinstance(entry, dict):
         raise ValueError("invalid cache manifest entry")
@@ -218,8 +236,9 @@ def _entry_path(entry: dict, roots: set[str], patterns: tuple[str, ...]) -> tupl
     if root is None:
         raise ValueError(f"cache manifest entry outside configured paths: {raw!r}")
     relative = path.relative_to(root)
-    if _excluded(relative, root, kind, patterns) or any(
-        _excluded(p, root, "directory", patterns) for p in relative.parents
+    local_root = roots[root.as_posix()]
+    if _excluded(relative, local_root, kind, patterns) or any(
+        _excluded(p, local_root, "directory", patterns) for p in relative.parents
     ):
         raise ValueError(f"excluded cache manifest entry: {raw!r}")
     return root, path
@@ -255,11 +274,11 @@ def _validate_destination(path: Path, kind: str) -> None:
         raise ValueError(f"incompatible local cache file type: {str(path)!r}")
 
 
-def _sibling_spellings(paths) -> dict[str, dict[str, str]]:
+def _sibling_spellings(paths, stop_at=()) -> dict[str, dict[str, str]]:
     """Index each component, including implicit parents of standalone files."""
     children = {}
     for path in paths:
-        while path.parts:
+        while path != path.parent and path not in stop_at:
             siblings = children.setdefault(path.parent.as_posix(), {})
             prior = siblings.setdefault(name_key(path.name), path.name)
             if prior != path.name:
@@ -272,16 +291,19 @@ def _sibling_spellings(paths) -> dict[str, dict[str, str]]:
 
 def _manifest_entries(records: list, config: CacheConfig) -> dict[str, dict]:
     """Validate unique names, payload references and the directory hierarchy of each root."""
-    roots = {p.as_posix() for p in config.roots}
     entries = {}
     payloads = {}
     directories = set()
+    roots = {p.as_posix(): local for p, local in config.root_paths.items()}
+    resolved = {}
     for entry in records:
         root, path = _entry_path(entry, roots, config.exclusions)
         spelling = path.as_posix()
         if spelling in entries:
             raise ValueError(f"duplicate cache entry: {spelling!r}")
         entries[spelling] = entry
+        local = roots[root.as_posix()] / path.relative_to(root)
+        resolved[str(local)] = entry
         if entry["type"] == "file":
             reference = entry["size"], entry["generation"]
             if payloads.setdefault(entry["sha256"], reference) != reference:
@@ -294,13 +316,16 @@ def _manifest_entries(records: list, config: CacheConfig) -> dict[str, dict]:
     if any(entries.get(d, {}).get("type") != "directory" for d in directories):
         raise ValueError("cache manifest is missing a required directory entry")
     _sibling_spellings(map(Path, entries))
-    return entries
+    return resolved
 
 
-def _check_destination_names(checkout: Path, paths) -> None:
+def _check_destination_names(config: CacheConfig, paths) -> None:
     """Compare each requested spelling with the actual directory listing before staging."""
-    for relative, expected in _sibling_spellings(paths).items():
-        parent = checkout / relative
+    # The agent supplies both bases. Resolving a home cache requires traversal
+    # permission on its ancestors, but listing other users' homes is unnecessary.
+    bases = (config.working_dir, Path.home())
+    for parent_name, expected in _sibling_spellings(paths, stop_at=bases).items():
+        parent = Path(parent_name)
         try:
             current = set(os.listdir(parent))
         except FileNotFoundError:
@@ -308,6 +333,13 @@ def _check_destination_names(checkout: Path, paths) -> None:
         for name in current:
             wanted = expected.get(name_key(name))
             if wanted is not None and wanted != name:
+                # An external ancestor may have a distinct case-sensitive sibling
+                # outside the selected trees. Its exact configured spelling wins.
+                if wanted in current and not (
+                    parent.is_relative_to(config.working_dir)
+                    or any(parent.is_relative_to(root) for root in config.root_paths.values())
+                ):
+                    continue
                 raise ValueError(
                     f"conflicting local cache name in {str(parent)!r}: {name!r}, {wanted!r}"
                 )
@@ -321,14 +353,13 @@ def _check_destination_names(checkout: Path, paths) -> None:
 
 def destinations(config: CacheConfig, manifest: dict) -> dict[str, dict] | None:
     """Resolve a compatible snapshot and check all live destinations before downloads."""
-    entries = _validated_entries(manifest, config)
-    if entries is None:
+    resolved = _validated_entries(manifest, config)
+    if resolved is None:
         return None
     _check_mounts(config)
-    resolved = {str(config.working_dir / name): entry for name, entry in entries.items()}
-    for spelling, entry in resolved.items():
-        _validate_destination(Path(spelling), entry["type"])
-    _check_destination_names(config.working_dir, map(Path, entries))
+    for name, entry in resolved.items():
+        _validate_destination(Path(name), entry["type"])
+    _check_destination_names(config, map(Path, resolved))
     return resolved
 
 
@@ -357,15 +388,18 @@ def stage_local(path: Path, entry: dict, staged: Path) -> bool:
         return False
 
 
-def _linux_mount_points() -> set[Path]:
+def _linux_mount_points() -> dict:
     # mountinfo escapes whitespace and backslashes. Decode with filesystem
     # encoding so paths with arbitrary POSIX filename bytes compare correctly.
+    def decode(field):
+        raw = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m[1], 8)]), field)
+        return Path(os.fsdecode(raw))
+
     with Path("/proc/self/mountinfo").open("rb") as table:
-        points = set()
+        points = {}
         for line in table:
-            field = line.split(maxsplit=5)[4]
-            unescaped = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m[1], 8)]), field)
-            points.add(Path(os.fsdecode(unescaped)))
+            _, _, device, root, point, _ = line.split(maxsplit=5)
+            points[decode(point)] = device, decode(root)
         return points
 
 
@@ -387,45 +421,95 @@ def _mount_relative(path: Path, parent: Path) -> Path | None:
     return None
 
 
-def _check_native_mount(path: Path) -> os.stat_result | None:
+def _check_mount_aliases(config: CacheConfig, mounts: dict, clearing: bool) -> None:
+    """Compare filesystem coordinates so a bind mount cannot alias a protected tree."""
+    deepest_first = sorted(mounts, key=lambda p: len(p.parts), reverse=True)
+
+    def location(path):
+        for point in deepest_first:
+            relative = _mount_relative(path, point)
+            if relative is not None:
+                device, source = mounts[point]
+                return device, source / relative, path
+        raise ValueError(f"cannot locate cache filesystem for {str(path)!r}")
+
+    def within(child, ancestor):
+        device, path, actual = child
+        disk, parent, visible_parent = ancestor
+        if device != disk:
+            return False
+        if path.is_relative_to(parent):
+            return True
+        depth = len(parent.parts)
+        if name_key(str(Path(*path.parts[:depth]))) != name_key(str(parent)):
+            return False
+        # A difference in case can identify separate directories on Linux. Compare
+        # actual inodes through both mount views, including the nearest existing
+        # ancestor when a job has yet to create the configured cache.
+        suffix = path.parts[depth:]
+        other = visible_parent.joinpath(*suffix)
+        for _ in range(len(suffix) + 1):
+            try:
+                return actual.samefile(other)
+            except (FileNotFoundError, NotADirectoryError):
+                actual, other = actual.parent, other.parent
+        return False
+
+    disjoint = [
+        location(config.state_dir.parent.resolve()),
+        location(config.state_dir.parent.parent),
+    ]
+    protected = [location(config.working_dir), location(Path.home().resolve())] if clearing else []
+    for local in config.root_paths.values():
+        root = location(local)
+        if any(within(root, p) or within(p, root) for p in disjoint):
+            raise CacheRootError(f"cache path aliases plugin files or another root: {str(local)!r}")
+        if any(within(p, root) for p in protected):
+            raise CacheRootError(
+                f"clearing this cache root would include the checkout or home: {str(local)!r}"
+            )
+        disjoint.append(root)
+
+
+def _check_native_mount(path: Path, *, allow_volume=False) -> os.stat_result | None:
     try:
         info = path.lstat()
     except (FileNotFoundError, NotADirectoryError):
         return None
     if stat.S_ISLNK(info.st_mode):
         return None
-    if os.path.ismount(path) or (
+    if (not allow_volume and os.path.ismount(path)) or (
         getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     ):
         raise ValueError(f"cache selection crosses mount or reparse point: {str(path)!r}")
     return info
 
 
-def _check_mounts(config: CacheConfig) -> None:
+def _check_mounts(config: CacheConfig, *, clearing=False) -> None:
     """Check mounts both on the approach to a root and anywhere inside its tree."""
     checkout = config.working_dir
     if sys.platform == "linux":
         # Bind mounts can have the same device number as the checkout.
-        for point in _linux_mount_points():
-            relative = _mount_relative(point, checkout)
-            if relative is None or not relative.parts:
-                continue
-            for root in config.roots:
-                selected = checkout / root
-                if (
-                    _mount_relative(point, selected) is not None
-                    or _mount_relative(selected, point) is not None
-                ):
+        mounts = _linux_mount_points()
+        _check_mount_aliases(config, mounts, clearing)
+        for selected in config.root_paths.values():
+            for point in mounts:
+                if (point == checkout and selected.is_relative_to(checkout)) or not point.name:
+                    continue
+                inside = _mount_relative(point, selected) is not None
+                below_checkout = _mount_relative(point, checkout) is not None
+                if inside or (below_checkout and _mount_relative(selected, point) is not None):
                     raise ValueError(f"cache selection crosses mount: {str(point)!r}")
         return
 
     # Native mount/reparse checks require a walk even on restore: a mount may
     # exist in an unrelated subtree that has no entries in the saved manifest.
-    for root in config.roots:
-        point = checkout
-        for part in root.parts:
+    for root in config.root_paths.values():
+        point = checkout if root.is_relative_to(checkout) else Path(root.anchor)
+        external = not root.is_relative_to(checkout)
+        for part in root.relative_to(point).parts:
             point /= part
-            if _check_native_mount(point) is None:
+            if _check_native_mount(point, allow_volume=external and point != root) is None:
                 break
         else:
             if point.is_dir():
@@ -457,8 +541,68 @@ def _replace(source: Path, path: Path, mode: int) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def install(entries: dict[str, dict], staged: dict[str, Path]) -> None:
-    """Prepare the target, install verified files, and apply directory modes after their children."""
+def _stale_entries(config: CacheConfig, entries: dict[str, dict]) -> list[tuple[Path, str, Path]]:
+    """Inspect all roots before deleting anything and retain ancestors of exclusions and links."""
+    _check_mounts(config, clearing=True)
+    candidates = []
+    keep = set(map(Path, entries))
+    for root in config.root_paths.values():
+        root_info = _inspect(root)
+        if root_info is None:
+            continue
+        pending = [(root, root_info)]
+        while pending:
+            path, info = pending.pop()
+            directory = stat.S_ISDIR(info.st_mode)
+            kind = "directory" if directory else "file"
+            if stat.S_ISLNK(info.st_mode) or _excluded(
+                path.relative_to(root), root, kind, config.exclusions
+            ):
+                keep.add(path.parent)
+                continue
+            candidates.append((path, _kind(info, path), root))
+            if directory:
+                # Leave the configured directory in place even when the cache is cold.
+                if path == root:
+                    keep.add(root)
+                pending.extend((child, child.lstat()) for child in path.iterdir())
+
+    # On a cold miss there are no manifest entries to trigger destination-name checks.
+    _check_destination_names(config, config.root_paths.values())
+    _sibling_spellings((p for p, _, _ in candidates), stop_at=(config.working_dir, Path.home()))
+    stale = []
+    for path, kind, root in reversed(candidates):
+        if path in keep:
+            keep.add(path.parent)
+        else:
+            stale.append((path, kind, root))
+    return stale
+
+
+def _remove_stale(path: Path, kind: str, root: Path) -> None:
+    """Remove one checked entry, borrowing write permission only inside its cache root."""
+    _validate_destination(path, kind)
+    parent = path.parent
+    mode = None
+    if path != root and not os.access(parent, os.W_OK | os.X_OK):
+        mode = stat.S_IMODE(parent.stat().st_mode)
+        parent.chmod(mode | 0o300)
+    try:
+        if kind == "directory":
+            path.rmdir()
+        else:
+            with _writable_for_removal(path):
+                path.unlink()
+    finally:
+        if mode is not None:
+            parent.chmod(mode)
+
+
+def install(config: CacheConfig, entries: dict[str, dict], staged: dict[str, Path]) -> None:
+    """Clear stale entries, install verified files, then restore directory modes."""
+    if config.clear:
+        for path, kind, root in _stale_entries(config, entries):
+            _remove_stale(path, kind, root)
     # Existing snapshot directories may be read-only. Temporarily permit child
     # writes only after staging succeeds and only in the affected directory trees.
     creates = set(staged)

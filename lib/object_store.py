@@ -260,17 +260,22 @@ def _invalid_constant(token):
     raise ValueError(f"invalid JSON number in cache manifest: {token}")
 
 
-def get_manifest(client, bucket: str, key: str, *, tolerate_invalid=False):
-    """Read one snapshot, allowing a forced save to rebuild an undecodable document."""
+def get_manifest(
+    client, bucket: str, key: str, *, tolerate_invalid=False
+) -> tuple[dict | None, str | None]:
+    """Read the snapshot and its ETag together so a writer can condition its publication."""
     try:
         response = client.get_object(Bucket=bucket, Key=key)
     except ClientError as exc:
         # An untyped HTTP 404 can indicate an incorrect endpoint.
         if exc.response.get("Error", {}).get("Code") == "NoSuchKey":
-            return None
+            return None, None
         raise
     with closing(response["Body"]) as body:
         raw = body.read()
+    etag = response.get("ETag")
+    if not isinstance(etag, str) or not etag or etag == "*":
+        raise ValueError("object store returned no usable ETag for cache manifest")
     try:
         document = json.loads(
             raw, object_pairs_hook=_manifest_fields, parse_constant=_invalid_constant
@@ -280,14 +285,28 @@ def get_manifest(client, bucket: str, key: str, *, tolerate_invalid=False):
     except (ValueError, RecursionError):
         if not tolerate_invalid:
             raise
-        return None
-    return document
+        # A forced repair still needs to match the version containing the malformed bytes.
+        document = None
+    return document, etag
 
 
-def publish_manifest(client, bucket: str, key: str, manifest: dict):
-    """Publish the complete snapshot. The last successful write selects the visible manifest."""
+def publish_manifest(client, bucket: str, key: str, manifest: dict, etag: str | None) -> bool:
+    """Commit against the version read at save time; a concurrent change skips publication."""
     body = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-    client.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+    condition = {"IfNoneMatch": "*"} if etag is None else {"IfMatch": etag}
+    try:
+        client.put_object(
+            Bucket=bucket, Key=key, Body=body, ContentType="application/json", **condition
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in {"PreconditionFailed", "412", "ConditionalRequestConflict"} or (
+            etag is not None and code == "NoSuchKey"
+        ):
+            # Re-reading and retrying would replace the winner with this stale snapshot.
+            return False
+        raise
+    return True
 
 
 def upload_payload(

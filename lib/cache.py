@@ -16,7 +16,13 @@ from threading import Lock
 
 import files
 import object_store
-from plugin_config import CACHE_FORMAT_VERSION, CacheConfig, load_config
+from plugin_config import (
+    CACHE_FORMAT_VERSION,
+    CacheConfig,
+    CacheRootError,
+    load_config,
+    validate_local_roots,
+)
 
 
 def log(message: str) -> None:
@@ -85,7 +91,7 @@ def _stage_files(client, bucket, prefix, destinations, tmp_dir, on_bytes):
 def _prepare_candidate(config, client, bucket, prefix, ref, staging, on_bytes):
     """Read the candidate once so every staged file comes from the same publication."""
     candidate = config.cache_prefix(prefix, ref)
-    manifest = object_store.get_manifest(client, bucket, f"{candidate}/manifest.json")
+    manifest, _ = object_store.get_manifest(client, bucket, f"{candidate}/manifest.json")
     if manifest is None:
         log(f"missing ref={ref or 'shared'!r}")
         return None
@@ -98,7 +104,8 @@ def _prepare_candidate(config, client, bucket, prefix, ref, staging, on_bytes):
 
 
 def restore(config: CacheConfig, tmp_dir: Path) -> dict:
-    """Resolve and stage each candidate in isolation, then install the first complete hit."""
+    """Stage each candidate, install the first complete hit, or clear after a clean miss."""
+    validate_local_roots(config, clearing=config.clear)
     try:
         client, bucket, prefix = object_store.open_store(config)
     except ValueError as exc:
@@ -123,6 +130,9 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
                     if prepared is None:
                         continue
                     destinations, replacements = prepared
+                except CacheRootError:
+                    # Every fallback ref uses the same configured local destinations.
+                    raise
                 except Exception as exc:
                     result["errors"].append(f"ref={ref_label!r}: {exc}")
                     result["outcome"] = "error"
@@ -130,7 +140,9 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
                         return result
                     continue
                 try:
-                    files.install(destinations, replacements)
+                    files.install(config, destinations, replacements)
+                except CacheRootError:
+                    raise
                 except Exception as exc:
                     # Fallback is safe only before installation starts changing live files.
                     result["errors"].append(f"install ref={ref_label!r}: {exc}")
@@ -140,6 +152,16 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
                 result["outcome"] = "restored"
                 return result
 
+        # A failed read may hide a valid snapshot. Clear on a miss only when
+        # every candidate was confirmed missing or incompatible.
+        if config.clear and not result["errors"]:
+            try:
+                files.install(config, {}, {})
+            except CacheRootError:
+                raise
+            except Exception as exc:
+                result["errors"].append(f"clear after miss: {exc}")
+                result["outcome"] = "error"
         return result
     finally:
         client.close()
@@ -171,6 +193,7 @@ def _store_payloads(client, bucket, prefix, entries, sources, previous_entries, 
 
 def save(config: CacheConfig, tmp_dir: Path) -> dict:
     """Select local inputs, reuse compatible payloads, and publish after all uploads succeed."""
+    validate_local_roots(config)
     selection = files.select_inputs(config)
     if not selection:
         return {"outcome": "skipped: missing inputs or no payload", "bytes": 0}
@@ -181,7 +204,9 @@ def save(config: CacheConfig, tmp_dir: Path) -> dict:
     try:
         target = config.cache_prefix(prefix)
         key = f"{target}/manifest.json"
-        previous = object_store.get_manifest(client, bucket, key, tolerate_invalid=config.force)
+        previous, etag = object_store.get_manifest(
+            client, bucket, key, tolerate_invalid=config.force
+        )
         previous_entries = []
         try:
             if previous is not None and files.validate_manifest(previous, config):
@@ -201,7 +226,8 @@ def save(config: CacheConfig, tmp_dir: Path) -> dict:
             "layout": files.layout(config),
             "entries": entries,
         }
-        object_store.publish_manifest(client, bucket, key, manifest)
+        if not object_store.publish_manifest(client, bucket, key, manifest, etag):
+            return {"outcome": "skipped: concurrent manifest change", "bytes": transferred}
         return {"outcome": "saved", "bytes": transferred}
     finally:
         client.close()
@@ -232,6 +258,8 @@ def run(operation: str) -> int:
             prefix=f"{operation}-", dir=config.state_dir
         ) as tmp_directory:
             result = handler(config, Path(tmp_directory))
+    except CacheRootError as exc:
+        result = {"outcome": "configuration error", "fatal": True, "errors": [str(exc)]}
     except Exception as exc:
         result = {"outcome": "error", "errors": [str(exc)]}
     errors = result.get("errors", [])

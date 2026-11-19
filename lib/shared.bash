@@ -3,8 +3,13 @@ set -euo pipefail
 
 PLUGIN_PREFIX="QDB_CACHE"
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Isolate environments because parallel jobs can share the plugin checkout.
-STATE_DIR="${PLUGIN_DIR}/.state/${BUILDKITE_JOB_ID:-}"
+# Cleanup recursively removes this directory. Every hook must have a job-specific
+# component before it can use the state shared by parallel jobs.
+if [[ ! "${BUILDKITE_JOB_ID:-}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  echo "qdb-cache: invalid or missing BUILDKITE_JOB_ID" >&2
+  exit 1
+fi
+STATE_DIR="${PLUGIN_DIR}/.state/${BUILDKITE_JOB_ID}"
 VENV_DIR="${STATE_DIR}/.venv"
 CACHE_PY="${PLUGIN_DIR}/lib/cache.py"
 
@@ -40,6 +45,12 @@ _find_python3() {
       fi
     done
   fi
+  echo "qdb-cache: Python 3.9+ is required on the host agent" >&2
+  return 1
+}
+
+check_state_dir() {
+  "$1" "${PLUGIN_DIR}/lib/plugin_config.py" "${STATE_DIR}"
 }
 
 # Venv layout differs between platforms:

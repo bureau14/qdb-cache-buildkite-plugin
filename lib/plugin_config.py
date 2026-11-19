@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
+import ntpath
 import os
+import re
+import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Mapping
+from unicodedata import normalize
 from urllib.parse import quote
 
 PREFIX = "BUILDKITE_PLUGIN_QDB_CACHE_"
-CACHE_FORMAT_VERSION = "1"
+CACHE_FORMAT_VERSION = "files-v3"
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -35,15 +37,6 @@ class CacheConfig:
     read_timeout: float
 
     @property
-    def layout_digest(self) -> str:
-        # Relative archive paths and exclusions distinguish compatible snapshots.
-        # The paths field keeps indexed-root snapshots from matching this layout.
-        payload = {"paths": [root.as_posix() for root in self.roots], "exclude": self.exclusions}
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-
-    @property
     def identity(self) -> str:
         parts = [self.pipeline]
         if self.git_ref is not None:
@@ -51,16 +44,16 @@ class CacheConfig:
         parts.extend(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in self.pairs.items())
         return "/".join(parts)
 
-    def object_key(self, prefix: str, git_ref: str | None = None) -> str:
+    def cache_prefix(self, prefix: str, git_ref: str | None = None) -> str:
         parts = [
             prefix.strip("/"),
             self.pipeline,
             (git_ref or self.git_ref) if self.git_ref is not None else None,
             "cache",
-            f"v{CACHE_FORMAT_VERSION}",
+            CACHE_FORMAT_VERSION,
         ]
         parts.extend(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in self.pairs.items())
-        return "/".join(p for p in parts if p) + "/snapshot.tar.zst"
+        return "/".join(p for p in parts if p)
 
 
 # Boolean/list parsing follows qdb-artifacts' _get_env_bool/_get_env_array helpers.
@@ -74,7 +67,9 @@ def _boolean(env: Mapping[str, str], name: str, default: bool) -> bool:
 def _strings(env: Mapping[str, str], name: str, required: bool = False) -> tuple[str, ...]:
     prefix = PREFIX + name
     values = []
-    while value := env.get(f"{prefix}_{len(values)}"):
+    while (value := env.get(f"{prefix}_{len(values)}")) is not None:
+        if not value:
+            raise ValueError(f"{name.lower()}: values must not be empty")
         values.append(value)
     if not values and env.get(prefix):
         values.append(env[prefix])
@@ -120,11 +115,87 @@ def _current_buildkite_git_ref(env: Mapping[str, str]) -> str | None:
     return None
 
 
-def _roots(paths: tuple[str, ...]) -> tuple[Path, ...]:
-    roots = tuple(sorted(Path(os.path.normpath(path)) for path in paths))
-    if any(root.anchor or ".." in root.parts for root in roots):
-        raise ValueError("path must be relative to the working directory")
-    return roots
+def name_key(name: str) -> str:
+    return normalize("NFC", normalize("NFD", name).casefold())
+
+
+def reserved_windows_component(name: str) -> bool:
+    if hasattr(ntpath, "isreserved"):
+        # Keep a colon in the component from being interpreted as a drive prefix.
+        return ntpath.isreserved(".\\" + name)
+    # Python 3.9-3.12 has the DOS device check in pathlib. The other forms
+    # can name an alternate stream, collapse into another name, or fail at installation.
+    return (
+        name.endswith((" ", "."))
+        or any(ord(c) < 32 or c in '<>:"|?*' for c in name)
+        or PureWindowsPath(name.partition(".")[0].rstrip(" ")).is_reserved()
+    )
+
+
+def normalize_path(raw: str) -> Path:
+    """Normalize relative coordinates without expanding a home, drive, or parent."""
+    if not isinstance(raw, str) or not raw or "\0" in raw:
+        raise ValueError("path must be a nonempty checkout-relative name")
+    path = Path(raw)
+    if (
+        path.anchor
+        or (os.name != "nt" and "\\" in raw)
+        or ".." in path.parts
+        or (path.parts and path.parts[0].startswith("~"))
+        or any(PureWindowsPath(part).drive for part in path.parts)
+    ):
+        raise ValueError(f"unsafe checkout-relative path: {raw!r}")
+    return path
+
+
+def normalize_roots(paths: tuple[str, ...]) -> tuple[Path, ...]:
+    """Check root spellings and overlaps before sorting the manifest layout."""
+    if not paths:
+        raise ValueError("path: expected at least one value")
+    roots = tuple(map(normalize_path, paths))
+    spellings = {}
+    names = set()
+    for root in roots:
+        name = root.as_posix()
+        if name in names:
+            raise ValueError(f"duplicate cache root: {name!r}")
+        names.add(name)
+        # Two roots can select different children through ambiguous parent names.
+        for index, part in enumerate(root.parts):
+            key = (*root.parts[:index], name_key(part))
+            if spellings.setdefault(key, part) != part:
+                raise ValueError(f"ambiguous cache root spelling: {name!r}")
+    for root in roots:
+        if any(parent.as_posix() in names for parent in root.parents):
+            raise ValueError(f"overlapping cache root: {root.as_posix()!r}")
+    return tuple(sorted(roots, key=lambda path: path.as_posix()))
+
+
+def _checkout(env: Mapping[str, str], cwd: Path | None = None) -> Path:
+    return Path(env.get("BUILDKITE_BUILD_CHECKOUT_PATH") or cwd or Path.cwd()).resolve()
+
+
+def _in_tree(path: Path, root: Path) -> bool:
+    # Path comparison alone misses alternative spellings on case-insensitive POSIX volumes.
+    for component in (path, *path.parents):
+        if component == root:
+            return True
+        try:
+            if component.samefile(root):
+                return True
+        except FileNotFoundError:
+            continue
+    return False
+
+
+def validate_state_dir(checkout: Path, state_dir: Path) -> None:
+    """Keep every job's private state outside the checkout, including during setup and cleanup."""
+    shared = state_dir.parent
+    resolved = shared.resolve()
+    if _in_tree(shared, checkout) or _in_tree(resolved, checkout) or _in_tree(checkout, resolved):
+        raise ValueError("the checkout and shared plugin state directory must be disjoint")
+    if state_dir.resolve() != resolved / state_dir.name:
+        raise ValueError("job state directory must reside inside shared plugin state")
 
 
 def load_config(
@@ -132,8 +203,12 @@ def load_config(
 ) -> CacheConfig:
     """Load cache paths, identity, fallback refs, and SDK options from Buildkite."""
     env = os.environ if env is None else env
-    cwd = Path.cwd() if cwd is None else cwd
-    job_id = env["BUILDKITE_JOB_ID"]
+    checkout = _checkout(env, cwd)
+    job_id = env.get("BUILDKITE_JOB_ID", "")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", job_id):
+        raise ValueError("invalid or missing BUILDKITE_JOB_ID")
+    state_dir = plugin_dir / ".state" / job_id
+    validate_state_dir(checkout, state_dir)
     pipeline = env["BUILDKITE_PIPELINE_SLUG"]
     use_git_ref = _boolean(env, "GIT_REF", True)
     git_ref = _current_buildkite_git_ref(env) if use_git_ref else None
@@ -151,14 +226,19 @@ def load_config(
         raise ValueError("retries must be a positive integer") from exc
     if retries <= 0:
         raise ValueError("retries must be a positive integer")
+    roots = normalize_roots(_strings(env, "PATH", required=True))
+    if os.name == "nt" and any(
+        reserved_windows_component(part) for root in roots for part in root.parts
+    ):
+        raise ValueError("path contains a reserved Windows component")
     return CacheConfig(
-        roots=_roots(_strings(env, "PATH", required=True)),
-        working_dir=cwd,
+        roots=roots,
+        working_dir=checkout,
         pairs=_pairs(env),
         exclusions=tuple(sorted(set(_strings(env, "EXCLUDE")))),
         pipeline=pipeline,
         git_ref=git_ref,
-        state_dir=plugin_dir / ".state" / job_id,
+        state_dir=state_dir,
         restore=_boolean(env, "RESTORE", True),
         save=_boolean(env, "SAVE", True),
         fallback_refs=tuple(refs),
@@ -168,3 +248,11 @@ def load_config(
         connect_timeout=_positive_timeout(env, "CONNECT_TIMEOUT", 10),
         read_timeout=_positive_timeout(env, "READ_TIMEOUT", 60),
     )
+
+
+if __name__ == "__main__":
+    # Setup and cleanup run on the host interpreter outside the per-job environment.
+    try:
+        validate_state_dir(_checkout(os.environ), Path(sys.argv[1]))
+    except (ValueError, OSError, RuntimeError) as exc:
+        sys.exit(f"qdb-cache: {exc}")

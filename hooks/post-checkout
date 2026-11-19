@@ -8,14 +8,8 @@ if [[ "$(plugin_read_config DEBUG false)" =~ ^(true|on|1)$ ]]; then
   set -x
 fi
 
-# Pre-flight: verify Python 3 is available on the host agent.
 PYTHON3_CMD="$(_find_python3)"
-if [[ -z "${PYTHON3_CMD}" ]]; then
-  echo "+++ :rotating_light: qdb-cache plugin requires python3.9+ on the host agent"
-  echo "Install Python 3.9+ on this agent or add it to the AMI via Packer."
-  exit 1
-fi
-
+check_state_dir "${PYTHON3_CMD}"
 REQUIREMENTS="${PLUGIN_DIR}/lib/requirements.txt"
 mkdir -p "${STATE_DIR}"
 

@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
+import tempfile
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
 
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
+from botocore import exceptions
 from botocore.exceptions import ClientError
+from files import hash_stream, open_regular
 from plugin_config import CacheConfig
 
 BACKEND_SSM_PARAM = "/services/buildkite/config/artifacts/object-store/backend"
@@ -19,6 +25,13 @@ ENDPOINT_URL_SSM_PARAM = "/services/buildkite/config/artifacts/object-store/endp
 R2_ACCOUNT_ID_SSM_PARAM = "/services/buildkite/config/artifacts/object-store/r2/account-id"
 R2_ACCESS_KEY_ID_SSM_PARAM = "/services/buildkite/config/artifacts/object-store/r2/access-key-id"
 R2_SECRET_ACCESS_KEY_SSM_PARAM = "/services/buildkite/credentials/artifacts/r2/secret-access-key"
+
+# File workers share one client. Parts run serially inside a worker, so streaming
+# bodies and multipart requests use the same four request slots as small files.
+MAX_WORKERS = 4
+_TRANSFER = TransferConfig(use_threads=False, preferred_transfer_client="classic")
+_BODY_ATTEMPTS = 2
+_STREAM_ERRORS = (exceptions.HTTPClientError, exceptions.IncompleteReadError)
 
 
 @dataclass(frozen=True)
@@ -150,12 +163,16 @@ def load_store_config(ssm):
 
 
 def parse_s3(uri):
-    """Parse s3://bucket/prefix URI into (bucket, prefix).
-    Also handles plain bucket names (legacy SSM format)."""
-    if not uri.startswith("s3://"):
-        return uri.strip("/"), ""
-    p = urlparse(uri)
-    return p.netloc, p.path.strip("/")
+    """Resolve a destination URI or the legacy plain bucket value before opening S3."""
+    bucket, prefix = uri, ""
+    if uri.startswith("s3://"):
+        bucket, _, prefix = uri[5:].partition("/")
+    # Preserve legacy bucket names accepted by the SDK, including uppercase
+    # letters and underscores. Credentials, ports, and URI query fields have
+    # no meaning in a cache destination.
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,255}", bucket) or "?" in uri or "#" in uri:
+        raise ValueError("artifact destination must be a plain bucket name or s3://bucket/prefix")
+    return bucket, prefix.strip("/")
 
 
 def _s3_client(cfg, operation: CacheConfig):
@@ -164,13 +181,14 @@ def _s3_client(cfg, operation: CacheConfig):
     R2 needs signature_version=s3v4 and addressing_style=path (R2 endpoints are
     account-level, not bucket-level — virtual-host style would produce invalid hostnames).
     """
-    client_cfg = sdk_config(operation)
+    # Both backends use the manifest SHA-256 for end-to-end file verification.
+    client_options = {"request_checksum_calculation": "when_required"}
     if cfg.backend == "r2":
-        client_cfg = sdk_config(
-            operation, signature_version="s3v4", s3={"addressing_style": "path"}
+        client_options.update(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
         )
-
-    kwargs = {"config": client_cfg}
+    kwargs = {"config": sdk_config(operation, **client_options)}
     if cfg.backend == "r2":
         kwargs["region_name"] = "auto"
     if cfg.endpoint_url:
@@ -229,33 +247,86 @@ def open_store(operation: CacheConfig):
         ssm.close()
 
 
-def is_missing(exc: ClientError) -> bool:
-    return exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404")
+def _manifest_fields(pairs):
+    # A repeated field can assign different layouts or destinations to the same
+    # document depending on the JSON decoder. Such a candidate is an error.
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise ValueError("duplicate JSON member in cache manifest")
+    return fields
 
 
-def head_snapshot(client, bucket: str, key: str):
+def _invalid_constant(token):
+    raise ValueError(f"invalid JSON number in cache manifest: {token}")
+
+
+def get_manifest(client, bucket: str, key: str, *, tolerate_invalid=False):
+    """Read one snapshot, allowing a forced save to rebuild an undecodable document."""
     try:
-        return client.head_object(Bucket=bucket, Key=key).get("Metadata", {})
+        response = client.get_object(Bucket=bucket, Key=key)
     except ClientError as exc:
-        if not is_missing(exc):
+        # An untyped HTTP 404 can indicate an incorrect endpoint.
+        if exc.response.get("Error", {}).get("Code") == "NoSuchKey":
+            return None
+        raise
+    with closing(response["Body"]) as body:
+        raw = body.read()
+    try:
+        document = json.loads(
+            raw, object_pairs_hook=_manifest_fields, parse_constant=_invalid_constant
+        )
+        if not isinstance(document, dict):
+            raise ValueError("cache manifest must be a JSON object")
+    except (ValueError, RecursionError):
+        if not tolerate_invalid:
             raise
         return None
+    return document
 
 
-def get_snapshot(client, bucket: str, key: str):
-    try:
-        return client.get_object(Bucket=bucket, Key=key)
-    except ClientError as exc:
-        if not is_missing(exc):
-            raise
-        return None
+def publish_manifest(client, bucket: str, key: str, manifest: dict):
+    """Publish the complete snapshot. The last successful write selects the visible manifest."""
+    body = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    client.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
 
 
-def upload_snapshot(client, bucket: str, key: str, path: Path, metadata: dict[str, str]):
-    client.upload_file(
-        str(path),
-        bucket,
-        key,
-        ExtraArgs={"ContentType": "application/zstd", "Metadata": metadata},
-        Config=TransferConfig(),
-    )
+def upload_payload(
+    client, bucket: str, key: str, path: Path, size: int, digest: str, tmp_dir: Path
+):
+    """Capture and verify private bytes before the SDK opens the file for upload or retry."""
+    with tempfile.TemporaryDirectory(dir=tmp_dir) as staging:
+        captured = Path(staging) / "payload"
+        with open_regular(path) as source, captured.open("wb") as output:
+            if hash_stream(source, output) != (digest, size):
+                raise ValueError(f"source changed during payload upload: {path}")
+        client.upload_file(str(captured), bucket, key, Config=_TRANSFER)
+    return size
+
+
+def download_payload(
+    client, bucket: str, key: str, path: Path, size: int, digest: str, *, on_bytes=None
+):
+    """Fetch the immutable key from the manifest, retry interrupted bodies, and verify the bytes."""
+    transferred = 0
+    # Each GET has its own configured SDK request attempts. Once the SDK hands
+    # us a response, an interrupted body needs a fresh GET for the same key.
+    for attempt in range(1, _BODY_ATTEMPTS + 1):
+        response = client.get_object(Bucket=bucket, Key=key)
+        try:
+            with closing(response["Body"]) as body:
+                if response["ContentLength"] != size:
+                    raise ValueError(f"payload length differs from manifest: {key}")
+                checksum = hashlib.sha256()
+                with path.open("wb") as output:
+                    for chunk in iter(lambda: body.read(_TRANSFER.io_chunksize), b""):
+                        transferred += len(chunk)
+                        if on_bytes is not None:
+                            on_bytes(len(chunk))
+                        output.write(chunk)
+                        checksum.update(chunk)
+                    if output.tell() != size or checksum.hexdigest() != digest:
+                        raise ValueError(f"payload length or SHA-256 differs from manifest: {key}")
+            return transferred
+        except _STREAM_ERRORS:
+            if attempt == _BODY_ATTEMPTS:
+                raise

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${DIR}/../lib/shared.bash"
+
+if [[ "$(plugin_read_config DEBUG false)" =~ ^(true|on|1)$ ]]; then
+  set -x
+fi
+
+PYTHON3_CMD="$(plugin_python)"
+check_state_dir "${PYTHON3_CMD}"
+REQUIREMENTS="${PLUGIN_DIR}/lib/requirements.txt"
+mkdir -p "${STATE_DIR}"
+
+if [[ -d "${VENV_DIR}" ]]; then
+  rm -rf "${VENV_DIR}"
+fi
+
+echo "~~~ :python: Setting up qdb-cache plugin"
+"${PYTHON3_CMD}" -m venv --upgrade-deps "${VENV_DIR}"
+"${VENV_BIN}/python" -m pip install --quiet \
+  --retries 3 --resume-retries 3 \
+  -r "${REQUIREMENTS}"

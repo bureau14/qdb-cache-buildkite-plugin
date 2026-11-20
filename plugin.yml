@@ -3,7 +3,6 @@ description: Restore and refresh file snapshots in S3 compatible storage
 author: https://github.com/bureau14
 requirements:
   - bash
-  - python3
 configuration:
   additionalProperties: false
   required:

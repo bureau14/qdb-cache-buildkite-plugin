@@ -18,7 +18,6 @@ from pathlib import Path
 from plugin_config import (
     CACHE_FORMAT_VERSION,
     CacheConfig,
-    CacheRootError,
     check_root_spellings,
     name_key,
     normalize_path,
@@ -109,7 +108,6 @@ def _excluded(relative: Path, root: Path, kind: str, patterns: tuple[str, ...]) 
 
 def select_inputs(config: CacheConfig) -> list[SourceEntry]:
     """Walk the available roots under their exclusions and validate the combined selection."""
-    _check_mounts(config)
     entries = []
     for wire, root in config.root_paths.items():
         try:
@@ -351,7 +349,6 @@ def destinations(config: CacheConfig, manifest: dict) -> dict[str, dict] | None:
     resolved = _validated_entries(manifest, config)
     if resolved is None:
         return None
-    _check_mounts(config)
     for name, entry in resolved.items():
         _validate_destination(Path(name), entry["type"])
     _check_destination_names(config, map(Path, resolved))
@@ -383,139 +380,6 @@ def stage_local(path: Path, entry: dict, staged: Path) -> bool:
         return False
 
 
-def _linux_mount_points() -> dict:
-    # mountinfo escapes whitespace and backslashes. Decode with filesystem
-    # encoding so paths with arbitrary POSIX filename bytes compare correctly.
-    def decode(field):
-        raw = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m[1], 8)]), field)
-        return Path(os.fsdecode(raw))
-
-    with Path("/proc/self/mountinfo").open("rb") as table:
-        points = {}
-        for line in table:
-            _, _, device, root, point, _ = line.split(maxsplit=5)
-            points[decode(point)] = device, decode(root)
-        return points
-
-
-def _mount_relative(path: Path, parent: Path) -> Path | None:
-    if path.is_relative_to(parent):
-        return path.relative_to(parent)
-    depth = len(parent.parts)
-    if len(path.parts) < depth:
-        return None
-    prefix = Path(*path.parts[:depth])
-    # A Linux casefold volume can resolve a configured spelling to the same
-    # mount even though mountinfo retains its original spelling.
-    if name_key(str(prefix)) == name_key(str(parent)):
-        try:
-            if prefix.samefile(parent):
-                return Path(*path.parts[depth:])
-        except (FileNotFoundError, NotADirectoryError):
-            pass
-    return None
-
-
-def _check_mount_aliases(config: CacheConfig, mounts: dict, clearing: bool) -> None:
-    """Compare filesystem coordinates so a bind mount cannot alias a protected tree."""
-    deepest_first = sorted(mounts, key=lambda p: len(p.parts), reverse=True)
-
-    def location(path):
-        for point in deepest_first:
-            relative = _mount_relative(path, point)
-            if relative is not None:
-                device, source = mounts[point]
-                return device, source / relative, path
-        raise ValueError(f"cannot locate cache filesystem for {str(path)!r}")
-
-    def within(child, ancestor):
-        device, path, actual = child
-        disk, parent, visible_parent = ancestor
-        if device != disk:
-            return False
-        if path.is_relative_to(parent):
-            return True
-        depth = len(parent.parts)
-        if name_key(str(Path(*path.parts[:depth]))) != name_key(str(parent)):
-            return False
-        # A difference in case can identify separate directories on Linux. Compare
-        # actual inodes through both mount views, including the nearest existing
-        # ancestor when a job has yet to create the configured cache.
-        suffix = path.parts[depth:]
-        other = visible_parent.joinpath(*suffix)
-        for _ in range(len(suffix) + 1):
-            try:
-                return actual.samefile(other)
-            except (FileNotFoundError, NotADirectoryError):
-                actual, other = actual.parent, other.parent
-        return False
-
-    disjoint = [
-        location(config.state_dir.parent.resolve()),
-        location(config.state_dir.parent.parent),
-    ]
-    protected = [location(config.working_dir), location(Path.home().resolve())] if clearing else []
-    for local in config.root_paths.values():
-        root = location(local)
-        if any(within(root, p) or within(p, root) for p in disjoint):
-            raise CacheRootError(f"cache path aliases plugin files or another root: {str(local)!r}")
-        if any(within(p, root) for p in protected):
-            raise CacheRootError(
-                f"clearing this cache root would include the checkout or home: {str(local)!r}"
-            )
-        disjoint.append(root)
-
-
-def _check_native_mount(path: Path, *, allow_volume=False) -> os.stat_result | None:
-    try:
-        info = path.lstat()
-    except (FileNotFoundError, NotADirectoryError):
-        return None
-    if stat.S_ISLNK(info.st_mode):
-        return None
-    if (not allow_volume and os.path.ismount(path)) or (
-        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
-    ):
-        raise ValueError(f"cache selection crosses mount or reparse point: {str(path)!r}")
-    return info
-
-
-def _check_mounts(config: CacheConfig, *, clearing=False) -> None:
-    """Check mounts both on the approach to a root and anywhere inside its tree."""
-    checkout = config.working_dir
-    if sys.platform == "linux":
-        # Bind mounts can have the same device number as the checkout.
-        mounts = _linux_mount_points()
-        _check_mount_aliases(config, mounts, clearing)
-        for selected in config.root_paths.values():
-            for point in mounts:
-                if (point == checkout and selected.is_relative_to(checkout)) or not point.name:
-                    continue
-                inside = _mount_relative(point, selected) is not None
-                below_checkout = _mount_relative(point, checkout) is not None
-                if inside or (below_checkout and _mount_relative(selected, point) is not None):
-                    raise ValueError(f"cache selection crosses mount: {str(point)!r}")
-        return
-
-    # Native mount/reparse checks require a walk even on restore: a mount may
-    # exist in an unrelated subtree that has no entries in the saved manifest.
-    for root in config.root_paths.values():
-        point = checkout if root.is_relative_to(checkout) else Path(root.anchor)
-        external = not root.is_relative_to(checkout)
-        for part in root.relative_to(point).parts:
-            point /= part
-            if _check_native_mount(point, allow_volume=external and point != root) is None:
-                break
-        else:
-            if point.is_dir():
-                pending = [point]
-                while pending:
-                    for child in pending.pop().iterdir():
-                        info = _check_native_mount(child)
-                        if info is not None and stat.S_ISDIR(info.st_mode):
-                            pending.append(child)
-
-
 def _replace(source: Path, path: Path, mode: int) -> None:
     # A sibling temp makes the final replacement atomic across staging filesystems.
     with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".qdb-cache-", delete=False) as data:
@@ -538,7 +402,6 @@ def _replace(source: Path, path: Path, mode: int) -> None:
 
 def _stale_entries(config: CacheConfig, entries: dict[str, dict]) -> list[tuple[Path, str, Path]]:
     """Inspect all roots before deleting anything and retain ancestors of exclusions and links."""
-    _check_mounts(config, clearing=True)
     candidates = []
     keep = set(map(Path, entries))
     for root in config.root_paths.values():

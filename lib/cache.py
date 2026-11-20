@@ -130,9 +130,6 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
                     if prepared is None:
                         continue
                     destinations, replacements = prepared
-                except CacheRootError:
-                    # Every fallback ref uses the same configured local destinations.
-                    raise
                 except Exception as exc:
                     result["errors"].append(f"ref={ref_label!r}: {exc}")
                     result["outcome"] = "error"
@@ -141,8 +138,6 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
                     continue
                 try:
                     files.install(config, destinations, replacements)
-                except CacheRootError:
-                    raise
                 except Exception as exc:
                     # Fallback is safe only before installation starts changing live files.
                     result["errors"].append(f"install ref={ref_label!r}: {exc}")
@@ -157,8 +152,6 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
         if config.clear and not result["errors"]:
             try:
                 files.install(config, {}, {})
-            except CacheRootError:
-                raise
             except Exception as exc:
                 result["errors"].append(f"clear after miss: {exc}")
                 result["outcome"] = "error"

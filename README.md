@@ -4,7 +4,7 @@ Caches files and directories in AWS S3 or Cloudflare R2. Caches are separated by
 
 ## Requirements
 
-Bash and Python 3.9+ must be available on the host agent. Storage access must be configured as described in [Backend configuration](#backend-configuration).
+The host agent must provide Bash and set `QDB_CICD_AGENT_PLUGIN_PYTHON` to the Python 3.9+ interpreter used to create the job's virtual environment and validate cleanup. Configure storage access as described in [Backend configuration](#backend-configuration).
 
 ## Usage
 
@@ -65,8 +65,6 @@ plugins:
 | `connect-timeout` | `10` | Positive finite connection timeout in seconds for storage and SSM requests. |
 | `read-timeout` | `60` | Positive finite read timeout in seconds for storage and SSM requests. |
 | `debug` | `false` | Enable Bash tracing. |
-
-Give each job exclusive use of its checkout and writable cache destinations through restore and build, including home-relative caches on shared agents. Keep the checkout disjoint from the plugin’s shared `.state` directory and cache roots separate from the plugin installation. Provision mounted checkouts without aliases of private state. A configured cache directory cannot contain a mount or cross a mount below the checkout. The checkout itself may be mounted. With clearing enabled, select individual cache directories or files. Selecting the whole checkout, home, or their ancestors for clearing fails configuration.
 
 Timeouts and retries apply per SDK request. If a payload download is interrupted after the response starts, the plugin makes one more GET for the same object key and restarts the download. Each of the two GET requests can use the configured SDK attempts.
 

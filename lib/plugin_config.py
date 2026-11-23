@@ -14,7 +14,7 @@ from unicodedata import normalize
 from urllib.parse import quote
 
 PREFIX = "BUILDKITE_PLUGIN_QDB_CACHE_"
-CACHE_FORMAT_VERSION = "files-v3"
+CACHE_FORMAT_VERSION = "v1"
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
 

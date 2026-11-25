@@ -18,13 +18,7 @@ BLOCK = 1024 * 1024
 
 
 def layout(config: CacheConfig) -> dict:
-    header = {
-        "paths": [p.as_posix() for p in config.root_paths],
-        "exclude": list(config.exclusions),
-    }
-    if config.external_layout:
-        header["root_specs"] = list(config.external_layout)
-    return header
+    return {"paths": sorted(config.root_paths), "exclude": list(config.exclusions)}
 
 
 def _lstat(path: Path) -> os.stat_result | None:
@@ -55,7 +49,8 @@ def hash_stream(data, copy=None) -> tuple[str, int]:
 
 @dataclass(frozen=True)
 class SourceEntry:
-    relative: Path
+    root: str
+    relative: str
     source: Path
     kind: str
     info: os.stat_result
@@ -101,12 +96,12 @@ def select_inputs(config: CacheConfig) -> list[SourceEntry]:
     """Sort included entries by manifest path for stable hard-link targets."""
     entries = []
     _check_parents(config.root_paths.values())
-    for wire, root in config.root_paths.items():
+    for name, root in config.root_paths.items():
         for path, info, kind in _walk_root(root, config.exclusions):
             if kind is not None:
-                relative = normalize_path((wire / path.relative_to(root)).as_posix())
-                entries.append(SourceEntry(relative, path, kind, info))
-    return sorted(entries, key=lambda item: item.relative.as_posix())
+                relative = normalize_path(path.relative_to(root).as_posix()).as_posix()
+                entries.append(SourceEntry(name, relative, path, kind, info))
+    return sorted(entries, key=lambda item: (item.root, item.relative))
 
 
 def capture(selection: list[SourceEntry]) -> tuple[list[dict], dict[str, tuple[Path, int]]]:
@@ -115,8 +110,12 @@ def capture(selection: list[SourceEntry]) -> tuple[list[dict], dict[str, tuple[P
     payloads = {}
     hardlinks = {}
     for item in selection:
-        path = item.relative.as_posix()
-        entry = {"path": path, "type": item.kind, "mode": item.info.st_mode & 0o777}
+        entry = {
+            "root": item.root,
+            "path": item.relative,
+            "type": item.kind,
+            "mode": item.info.st_mode & 0o777,
+        }
         if item.kind == "symlink":
             entry["target"] = os.readlink(item.source)
             # Windows needs the link type even when its target is missing.
@@ -125,11 +124,12 @@ def capture(selection: list[SourceEntry]) -> tuple[list[dict], dict[str, tuple[P
         elif item.kind == "file":
             if item.info.st_nlink > 1 and item.info.st_ino:
                 inode = item.info.st_dev, item.info.st_ino
-                target = hardlinks.setdefault(inode, path)
-                if target != path:
+                target = hardlinks.get(inode)
+                if target is not None:
                     entry.update(type="hardlink", target=target)
                     entries.append(entry)
                     continue
+                hardlinks[inode] = {"root": item.root, "path": item.relative}
             with item.source.open("rb") as data:
                 digest, size = hash_stream(data)
             entry.update(sha256=digest, size=size)
@@ -140,6 +140,9 @@ def capture(selection: list[SourceEntry]) -> tuple[list[dict], dict[str, tuple[P
 
 def compatible_entries(manifest: dict, config: CacheConfig) -> list | None:
     """Check compatibility before interpreting entries belonging to another snapshot layout."""
+    # Earlier v1 writers included a format field and encoded roots in the entry paths.
+    if manifest.get("format") == "v1":
+        return None
     recorded = manifest.get("layout")
     exclusions = recorded.get("exclude") if isinstance(recorded, dict) else None
     if not isinstance(exclusions, list) or not all(isinstance(p, str) for p in exclusions):
@@ -156,47 +159,35 @@ def compatible_entries(manifest: dict, config: CacheConfig) -> list | None:
     return manifest["entries"]
 
 
-def _entry_path(
-    entry: dict, roots: dict[str, Path], patterns: tuple[str, ...]
-) -> tuple[Path, Path]:
-    """Locate the owning root and enforce the configured restore scope."""
-    raw = entry["path"]
-    path = normalize_path(raw)
-    kind = entry["type"]
-    root = next((p for p in (path, *path.parents) if p.as_posix() in roots), None)
-    if root is None:
-        raise ValueError(f"cache manifest entry outside configured paths: {raw!r}")
-    relative = path.relative_to(root)
-    local_root = roots[root.as_posix()]
-    # Every directory inside a root must have its own entry, so its exclusion is checked there.
-    if _excluded(relative, local_root, kind, patterns):
-        raise ValueError(f"excluded cache manifest entry: {raw!r}")
-    return root, path
-
-
 def _manifest_entries(records: list, config: CacheConfig) -> dict[str, dict]:
-    """Validate unique names, directory parents and hard-link destinations."""
+    """Bind entries to configured roots, check directory parents, then resolve hard links."""
     locations = {}
     directories = set()
-    roots = {p.as_posix(): local for p, local in config.root_paths.items()}
     resolved = {}
     for entry in records:
-        root, path = _entry_path(entry, roots, config.exclusions)
-        spelling = path.as_posix()
-        if spelling in locations:
-            raise ValueError(f"duplicate cache entry: {spelling!r}")
-        local = str(roots[root.as_posix()] / path.relative_to(root))
-        locations[spelling] = local
-        resolved[local] = entry
-        # Each recorded parent requires its own parent, up to the configured root.
-        if path != root:
-            directories.add(path.parent.as_posix())
-    if any(resolved.get(locations.get(d), {}).get("type") != "directory" for d in directories):
+        name = entry["root"]
+        root = config.root_paths[name]
+        relative = normalize_path(entry["path"])
+        local = root / relative
+        kind = entry["type"]
+        # Clearing is safe only after every entry has a known installation action.
+        if kind not in ("file", "directory", "symlink", "hardlink"):
+            raise ValueError(f"unsupported cache manifest entry type {kind!r} at {str(local)!r}")
+        if _excluded(relative, root, kind, config.exclusions):
+            raise ValueError(f"excluded cache manifest entry: {str(local)!r}")
+        if str(local) in resolved:
+            raise ValueError(f"duplicate cache entry: {str(local)!r}")
+        resolved[str(local)] = entry
+        locations[name, relative.as_posix()] = str(local)
+        if relative.parts:
+            directories.add(str(local.parent))
+    if any(resolved.get(d, {}).get("type") != "directory" for d in directories):
         raise ValueError("cache manifest is missing a required directory entry")
     for local, entry in resolved.items():
         if entry["type"] == "hardlink":
-            # A hard link can only reference an included regular file, never an arbitrary host path.
-            target = locations.get(entry["target"])
+            # Links may span roots, but the target must be a regular file in this snapshot.
+            reference = entry["target"]
+            target = locations.get((reference["root"], reference["path"]))
             if resolved.get(target, {}).get("type") != "file":
                 raise ValueError(f"invalid cache hard link for {entry['path']!r}")
             resolved[local] = {**entry, "target": target}

@@ -18,8 +18,7 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
 @dataclass(frozen=True)
 class CacheConfig:
-    root_paths: dict[Path, Path]
-    external_layout: tuple[str, ...]
+    root_paths: dict[str, Path]
     working_dir: Path
     pairs: dict[str, str]
     exclusions: tuple[str, ...]
@@ -43,8 +42,7 @@ class CacheConfig:
 
     def cache_prefix(self, prefix: str, git_ref: str | None = None) -> str:
         # Hash portable specifications so checkout and home locations can differ across agents.
-        paths = self.external_layout or tuple(p.as_posix() for p in self.root_paths)
-        encoded_paths = json.dumps(sorted(paths), separators=(",", ":")).encode("ascii")
+        encoded_paths = json.dumps(sorted(self.root_paths), separators=(",", ":")).encode("ascii")
         parts = [
             prefix.strip("/"),
             self.pipeline,
@@ -118,7 +116,7 @@ def normalize_path(raw: str, *, allow_parent: bool = False) -> Path:
         path.anchor
         or (os.name != "nt" and "\\" in raw)
         or (".." in path.parts and not allow_parent)
-        or (path.parts and path.parts[0].startswith("~"))
+        or (allow_parent and path.parts and path.parts[0].startswith("~"))
         or any(PureWindowsPath(part).drive for part in path.parts)
     ):
         raise ValueError(f"unsafe checkout-relative path: {raw!r}")
@@ -147,43 +145,31 @@ def validate_state_dir(checkout: Path, state_dir: Path) -> None:
         raise CacheRootError("job state directory must reside inside shared plugin state")
 
 
-def _configured_roots(
-    paths: tuple[str, ...], checkout: Path
-) -> tuple[dict[Path, Path], tuple[str, ...]]:
-    """Bind trusted pipeline paths to local roots and assign portable manifest names.
-
-    A checkout-only layout retains its existing wire paths. Mixed layouts number
-    the sorted path specifications, so a home-relative root maps to each job's home.
-    """
+def _configured_roots(paths: tuple[str, ...], checkout: Path) -> dict[str, Path]:
+    """Map each portable root specification to its location on this agent."""
     locations = {}
-    external = False
     for raw in paths:
         path = Path(raw)
         if "\0" in raw or (os.name != "nt" and "\\" in raw):
             raise ValueError(f"invalid cache path: {raw!r}")
         if path.is_absolute() or (path.parts and path.parts[0] == "~"):
-            external = True
             local = path.expanduser()
         else:
             local = checkout / normalize_path(raw, allow_parent=True)
-            external |= ".." in path.parts
         if local.name == "..":
             local = local.resolve()
         if not local.name or path.as_posix() in locations:
             raise ValueError(f"filesystem root or duplicate cache path: {raw!r}")
         locations[path.as_posix()] = local
 
-    specs = sorted(locations)
-    if external:
-        return {Path(str(i)): locations[s] for i, s in enumerate(specs)}, tuple(specs)
-    return {Path(s): locations[s] for s in specs}, ()
+    return locations
 
 
 def bind_local_roots(config: CacheConfig, *, clearing=False) -> CacheConfig:
     """Check live overlaps and bind external paths when an enabled operation starts."""
     checked = [config.state_dir.parent.parent.resolve(), config.state_dir.parent.resolve()]
     bound = {}
-    for wire, configured in config.root_paths.items():
+    for name, configured in config.root_paths.items():
         # Cache the leaf itself (which may be a symlink), while comparing its real parent.
         local = configured.parent.resolve() / configured.name
         if any(local.is_relative_to(p) or p.is_relative_to(local) for p in checked):
@@ -199,9 +185,9 @@ def bind_local_roots(config: CacheConfig, *, clearing=False) -> CacheConfig:
         checked.append(local)
         # Explicit external paths opt into traversing agent-owned aliases.
         # Checkout-relative paths still traverse the checkout under the normal link checks.
-        spec = Path(config.external_layout[int(wire.name)]) if config.external_layout else wire
+        spec = Path(name)
         external = spec.is_absolute() or spec.parts[:1] == ("~",) or ".." in spec.parts
-        bound[wire] = local if external else configured
+        bound[name] = local if external else configured
     return replace(config, root_paths=bound)
 
 
@@ -227,10 +213,8 @@ def load_config(
     paths = _strings(options["path"])
     if not paths:
         raise ValueError("path: expected at least one value")
-    roots, external_layout = _configured_roots(paths, checkout)
     return CacheConfig(
-        root_paths=roots,
-        external_layout=external_layout,
+        root_paths=_configured_roots(paths, checkout),
         working_dir=checkout,
         pairs=_pairs(options.get("keys", [])),
         exclusions=tuple(sorted(set(_strings(options.get("exclude", []))))),

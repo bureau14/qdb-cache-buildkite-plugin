@@ -1,14 +1,12 @@
 # qdb-cache-buildkite-plugin
 
-This Buildkite plugin restores files and directories from AWS S3 or Cloudflare R2 before a step runs. After the command succeeds, it saves the cache for subsequent builds.
-
-## Requirements
-
-The agent needs Bash and a Python 3.9+ interpreter. Set `QDB_CICD_AGENT_PLUGIN_PYTHON` to the interpreter’s path. Configure storage access as described in [Backend configuration](#backend-configuration).
+Cache files and directories between Buildkite jobs using AWS S3 or Cloudflare R2. The plugin restores the cache before the step's command runs and saves changes after the command succeeds.
 
 ## Usage
 
-### Cache files and directories
+The agent needs Bash, Python 3.9 or later, and access to the storage bucket. Set `QDB_CICD_AGENT_PLUGIN_PYTHON` to the Python executable. See [Backend configuration](#backend-configuration) for storage settings.
+
+To cache Maven dependencies and a build output file, list their paths in the step:
 
 ```yaml
 steps:
@@ -17,108 +15,86 @@ steps:
     plugins:
       - bureau14/qdb-cache#master:
           path:
-            - build/Testing/Temporary/CTestCostData.txt
-            - .cache
             - ~/.m2/repository
-          keys:
-            - key: os
-              value: linux
-            - key: compiler
-              value: gcc15
+            - build/Testing/Temporary/CTestCostData.txt
 ```
 
-### Restore without updating the stored cache
+Use Unix-style paths with forward slashes (`/`), including on Windows. Relative paths start at the checkout. For example, `.cache` is inside the checkout, `../relative` is a sibling directory, and `~/.m2` is in the agent user's home. Absolute paths also work. On Windows, include the slash after the drive letter, as in `C:/cache`.
+
+List each path once. If you list a directory, its contents are already included. To cache a single path, write `path: .cache`. This example restores that directory, skips lock files, and keeps the stored cache unchanged:
 
 ```yaml
 plugins:
   - bureau14/qdb-cache#master:
       path: .cache
+      exclude: '*.lock'
       save: false
-```
-
-Set `restore: false` for a step that should only update the stored cache.
-
-### Disable branch fallback
-
-```yaml
-plugins:
-  - bureau14/qdb-cache#master:
-      path: .cache
-      fallback: disabled
 ```
 
 ## Configuration reference
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `path` | Required | File or directory, or a nonempty list of disjoint paths. A relative path starts at the job checkout, `~/` starts at the agent user's home, and an absolute path selects that local location. Use forward slashes for portable configurations. Duplicate or overlapping roots, drive-relative paths, and parent traversal are rejected. |
-| `keys` | Empty list | Key/value pairs selecting an independent cache. Keys must be nonempty and unique; values are strings and may be empty. |
-| `git-ref` | `true` | Use the build’s tag or branch. Set a branch name or full ref to choose the cache explicitly, or use `false` to share across all refs. |
-| `restore` | `true` | Restore before the command. |
-| `clear` | `true` | Remove eligible local files absent from a verified snapshot. If all refs miss, clear eligible contents of the configured roots. Set to `false` to preserve extra local files on a hit or miss. Applies when restore is enabled. |
-| `save` | `true` | Create or update the stored cache after a successful command. |
-| `fallback` | `default` | Try `master` then `main` after the selected ref. Use `disabled` to try only the selected ref. |
-| `exclude` | Empty list | Case-sensitive glob pattern or list of patterns relative to each cached directory; a file path uses its basename. |
-| `force` | `false` | Publish the manifest even when the snapshot is unchanged. |
-| `strict` | `false` | Fail the hook on operational errors. Configuration and setup errors always fail. |
-| `parallelism` | Host CPU count (or `1` if unknown) | Maximum number of files uploaded or downloaded concurrently. Set a positive integer to limit transfer concurrency on shared agents. |
-| `retries` | `3` | Maximum attempts per SDK request, including the first. |
-| `connect-timeout` | `10` | Positive finite connection timeout in seconds for storage and SSM requests. |
-| `read-timeout` | `60` | Positive finite read timeout in seconds for storage and SSM requests. |
-| `debug` | `false` | Enable Bash tracing. |
+| `path` | Required | List of files or directories to cache. |
+| `keys` | `[]` | Give steps separate caches, for example by compiler or OS. |
+| `git-ref` | `true` | Use the build's tag or branch. Set a branch name or full Git ref to choose one, or `false` to share across refs. |
+| `restore` | `true` | Restore the cache before the command runs. |
+| `clear` | `true` | During restore, delete local files missing from the cache. If no cache exists, clear the listed paths. Excluded files are kept. |
+| `save` | `true` | Update the cache after the command succeeds. |
+| `fallback` | `default` | Try `master`, then `main`, if the selected ref misses. Set to `disabled` to skip fallback. |
+| `exclude` | `[]` | Skip paths matching a glob pattern or list of patterns. Patterns are case-sensitive and relative to each cached directory. For a single file, they match its name. |
+| `force` | `false` | Write the manifest even when the cache contents are unchanged. |
+| `strict` | `false` | Fail the hook on save or restore errors. Setup and configuration errors always fail the hook. |
+| `parallelism` | Agent CPU count | Maximum number of files to transfer at once. The default is 1 if the CPU count is unknown. |
+| `retries` | `3` | Maximum attempts per storage or SSM request, including the first attempt. |
+| `connect-timeout` | `10` | Seconds to wait for a storage or SSM connection. |
+| `read-timeout` | `60` | Seconds to wait for a read from storage or SSM. |
+| `debug` | `false` | Enable Bash tracing for the hooks. |
 
-To exclude lock files, use a quoted glob pattern.
+## Sharing a cache
+
+Within a pipeline, steps share a cache when their paths, Git ref, and `keys` match. The order of paths and keys doesn't matter. To keep separate caches for different compilers, add a key:
 
 ```yaml
 path: .cache
-exclude:
-  - '*.lock'
+keys:
+  - key: compiler
+    value: gcc15
 ```
 
-## How it works
+Each key needs a unique, nonempty name and a string value. An empty string is a valid value.
 
-| Hook | Action |
-| --- | --- |
-| `post-checkout` | Prepare the job's Python environment. |
-| `pre-command` | Restore the cache. |
-| `post-command` | Update the stored cache after command success. |
-| `pre-exit` | Remove the job's Python environment and temporary state, including after failures or when saving is disabled. |
-
-A cache miss allows the build to continue. The plugin logs operational errors and annotates the Buildkite job. Set `strict: true` to fail the hook on an operational error.
-
-### Cache identity and fallback
-
-Within a pipeline, the configured path set, Git ref, and optional `keys` identify a cache. Path order and key order do not affect its identity. Use `keys` when steps cache the same paths but need separate contents, for example for different compilers.
-
-With destination `s3://ci-cache/buildkite`, the build example on branch `feature` of pipeline `example` uses the following manifest. `<path-hash>` is the SHA-256 digest of the configured path set.
-
-```text
-s3://ci-cache/buildkite/example/refs/heads/feature/cache/v1/paths-<path-hash>/compiler=gcc15/os=linux/manifest.json
-```
-
-By default, a tag takes precedence over the build branch. Restore tries the selected ref first, then `master` and `main`. Save publishes to the selected ref. To have several branches read and update the same named cache, select it explicitly, for example with a variable supplied at pipeline upload time.
+By default, the plugin uses the build's tag if there is one, otherwise its branch. Restore can fall back to `master` and `main`. Save always writes to the selected ref. To have jobs on different branches read and update the same branch cache, set `git-ref` explicitly:
 
 ```yaml
 plugins:
   - bureau14/qdb-cache#master:
       path: node_modules
-      git-ref: "${CACHE_BRANCH}"
+      git-ref: "master"
       fallback: disabled
 ```
 
-With `CACHE_BRANCH=main`, those jobs read and write the `refs/heads/main` cache. Set `git-ref: false` to omit the ref from the cache key entirely.
+To share one cache across all branches and tags, use `git-ref: false`.
 
-### What gets saved
+The manifest lists the files in the cache. For pipeline `example` on branch `feature`, the compiler example above stores it at the following location. The path hash is the SHA-256 of the configured paths.
 
-The plugin stores regular files individually and reuses identical contents from the last compatible snapshot. The snapshot includes empty directories, file and directory permissions, and symbolic links, including dangling links. Hard-linked names within the snapshot restore as links to the same file. A selected file whose other names are outside the snapshot restores as an independent file.
+```text
+s3://ci-cache/buildkite/example/refs/heads/feature/cache/v1/paths-<path-hash>/compiler=gcc15/manifest.json
+```
 
-Missing paths are omitted. If nothing is eligible to save, the stored snapshot stays in place. The plugin publishes the manifest after all uploads succeed. If another job updates the manifest first, its snapshot wins.
+## How restore and save work
 
-### What restore changes
+**Restore.** The plugin reuses local files whose contents match the cache. For each download, it checks the size and SHA-256 checksum before installing the file. If the manifest or a download fails verification, it tries the next fallback unless `strict: true`.
 
-Restore reuses local files with matching contents and verifies each download’s size and SHA-256 checksum before installing it. If a manifest or download fails verification, restore tries the next configured ref unless `strict: true`.
+With the default `clear: true`, restore removes extra files from the listed paths. If every ref misses, it clears those paths and the build continues. Excluded files stay in place. Set `clear: false` to keep extra local files even on a miss. The agent needs write access to the directories it restores. A filesystem error during installation can leave some files restored and others untouched.
 
-By default, restore removes local entries absent from the snapshot and preserves excluded paths. If every ref misses, it clears eligible entries under the configured paths. Set `clear: false` to keep extra local files in either case. The agent needs write access to the affected directories. A filesystem error during installation can leave a partially restored tree.
+**Save.** The plugin uploads files individually and reuses identical content from the previous compatible cache. Keep files, links, and their parent directories stable while saving. If a file changes after the plugin hashes it, the uploaded file can fail verification on restore.
+
+The cache preserves empty directories, file and directory permissions, and symbolic links, including links whose targets are missing. Hard links within the cache still point to the same file after restore. If only one name for a hard-linked file is cached, it restores as an independent file.
+
+Save skips missing paths. If there is nothing to save, it keeps the previous cache. It writes the manifest only after all uploads succeed. If another job updates the manifest first, that job's cache wins.
+
+**Hooks.** `post-checkout` prepares the job's Python environment, `pre-command` restores the cache, and `post-command` saves it after a successful command. The `pre-exit` hook removes the environment and temporary files, including after a failure or when saving is disabled. The plugin logs cache errors and adds an annotation to the Buildkite job.
 
 ## Backend configuration
 

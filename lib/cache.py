@@ -17,7 +17,6 @@ from pathlib import Path
 import files
 import object_store
 from plugin_config import (
-    CACHE_FORMAT_VERSION,
     CacheConfig,
     CacheRootError,
     load_config,
@@ -187,7 +186,7 @@ def _store_payloads(client, bucket, prefix, entries, sources, previous_entries, 
         return sum(pool.map(upload, pending))
 
 
-def save(config: CacheConfig, tmp_dir: Path) -> dict:
+def save(config: CacheConfig) -> dict:
     """Select local inputs, reuse compatible payloads, and publish after all uploads succeed."""
     config = bind_local_roots(config)
     selection = files.select_inputs(config)
@@ -211,7 +210,6 @@ def save(config: CacheConfig, tmp_dir: Path) -> dict:
         if not config.force and previous_entries == entries:
             return {"outcome": "unchanged", "bytes": transferred}
         manifest = {
-            "format": CACHE_FORMAT_VERSION,
             "layout": files.layout(config),
             "entries": entries,
         }
@@ -230,17 +228,17 @@ def run(operation: str) -> int:
         log(f"configuration error: {exc}")
         annotate(operation, "configuration", [str(exc)], fatal=True)
         return 1
-    handler, enabled = {
-        "restore": (restore, config.restore),
-        "save": (save, config.save),
-    }[operation]
+    enabled = {"restore": config.restore, "save": config.save}[operation]
     if not enabled:
         log(f"{operation} disabled; identity={config.identity!r} bytes=0")
         return 0
     started = time.monotonic()
     try:
-        config.state_dir.mkdir(parents=True, exist_ok=True)
-        result = handler(config, config.state_dir)
+        if operation == "restore":
+            config.state_dir.mkdir(parents=True, exist_ok=True)
+            result = restore(config, config.state_dir)
+        else:
+            result = save(config)
     except CacheRootError as exc:
         result = {"outcome": "configuration error", "fatal": True, "errors": [str(exc)]}
     except Exception as exc:

@@ -44,11 +44,8 @@ def _check_parents(paths) -> None:
 
 
 def open_regular(path: Path):
-    _check_parents([path])
-    info = _lstat(path)
-    if info is None:
-        raise FileNotFoundError(path)
-    if not stat.S_ISREG(info.st_mode):
+    # Selection checks parent directories; recheck the leaf before reading its contents.
+    if not stat.S_ISREG(path.lstat().st_mode):
         raise ValueError(f"expected a regular file: {str(path)!r}")
     return path.open("rb")
 

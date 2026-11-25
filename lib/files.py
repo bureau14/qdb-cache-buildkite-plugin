@@ -230,9 +230,8 @@ def _entry_path(
         raise ValueError(f"cache manifest entry outside configured paths: {raw!r}")
     relative = path.relative_to(root)
     local_root = roots[root.as_posix()]
-    if _excluded(relative, local_root, kind, patterns) or any(
-        _excluded(p, local_root, "directory", patterns) for p in relative.parents
-    ):
+    # Every directory inside a root must have its own entry, so its exclusion is checked there.
+    if _excluded(relative, local_root, kind, patterns):
         raise ValueError(f"excluded cache manifest entry: {raw!r}")
     return root, path
 

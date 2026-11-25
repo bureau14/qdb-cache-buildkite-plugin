@@ -40,11 +40,11 @@ class StoreConfig:
     r2_secret_access_key: str | None = None
 
 
-def _ssm_get_optional(ssm, name, with_decryption=True):
+def _ssm_get_optional(ssm, name):
     """Return SSM parameter value or None if absent. Re-raises non-NotFound errors
     so IAM misconfigurations surface explicitly."""
     try:
-        return ssm.get_parameter(Name=name, WithDecryption=with_decryption)["Parameter"]["Value"]
+        return ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"]
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code")
         if code == "ParameterNotFound":
@@ -57,20 +57,18 @@ def _ssm_get_optional(ssm, name, with_decryption=True):
 _PLACEHOLDER_PREFIXES = ("SET_ME", "REPLACE_", "TODO", "CHANGEME", "FIXME")
 
 
-def _check_placeholder(value, label):
-    """Reject credentials that still contain an unconfigured placeholder."""
-    if value and any(value.startswith(p) for p in _PLACEHOLDER_PREFIXES):
+def _required_r2_setting(ssm, env_name, ssm_name, label):
+    value = os.environ.get(env_name) or _ssm_get_optional(ssm, ssm_name)
+    if not value:
         raise ValueError(
-            f"{label} contains an unconfigured placeholder — "
+            f"R2 backend requires {label}. Set env var {env_name} or SSM parameter {ssm_name}"
+        )
+    if value.startswith(_PLACEHOLDER_PREFIXES):
+        raise ValueError(
+            f"R2 {label} (SSM {ssm_name}) contains an unconfigured placeholder — "
             f"replace it with the real credential in Terraform tfvars or SSM"
         )
-
-
-def _env_or_ssm(ssm, env_name, ssm_name, with_decryption=True):
-    """Env var with SSM fallback. Env takes precedence for per-job overrides."""
-    return os.environ.get(env_name) or _ssm_get_optional(
-        ssm, ssm_name, with_decryption=with_decryption
-    )
+    return value
 
 
 def load_store_config(ssm):
@@ -103,40 +101,17 @@ def load_store_config(ssm):
     if backend == "r2":
         endpoint_url = endpoint_url or _ssm_get_optional(ssm, ENDPOINT_URL_SSM_PARAM)
 
-        r2_account_id = _env_or_ssm(ssm, "ARTIFACTS_R2_ACCOUNT_ID", R2_ACCOUNT_ID_SSM_PARAM)
-        if not r2_account_id:
-            raise ValueError(
-                f"R2 backend requires Cloudflare account ID. "
-                f"Set env var ARTIFACTS_R2_ACCOUNT_ID or SSM parameter {R2_ACCOUNT_ID_SSM_PARAM}"
-            )
-        _check_placeholder(r2_account_id, f"R2 account ID (SSM {R2_ACCOUNT_ID_SSM_PARAM})")
-
-        r2_access_key_id = _env_or_ssm(
-            ssm,
-            "ARTIFACTS_R2_ACCESS_KEY_ID",
-            R2_ACCESS_KEY_ID_SSM_PARAM,
+        r2_account_id = _required_r2_setting(
+            ssm, "ARTIFACTS_R2_ACCOUNT_ID", R2_ACCOUNT_ID_SSM_PARAM, "account ID"
         )
-        if not r2_access_key_id:
-            raise ValueError(
-                f"R2 backend requires access key ID. "
-                f"Set env var ARTIFACTS_R2_ACCESS_KEY_ID or SSM parameter {R2_ACCESS_KEY_ID_SSM_PARAM}"
-            )
-        _check_placeholder(r2_access_key_id, f"R2 access key ID (SSM {R2_ACCESS_KEY_ID_SSM_PARAM})")
-
-        r2_secret_access_key = _env_or_ssm(
+        r2_access_key_id = _required_r2_setting(
+            ssm, "ARTIFACTS_R2_ACCESS_KEY_ID", R2_ACCESS_KEY_ID_SSM_PARAM, "access key ID"
+        )
+        r2_secret_access_key = _required_r2_setting(
             ssm,
             "ARTIFACTS_R2_SECRET_ACCESS_KEY",
             R2_SECRET_ACCESS_KEY_SSM_PARAM,
-            with_decryption=True,
-        )
-        if not r2_secret_access_key:
-            raise ValueError(
-                f"R2 backend requires secret access key. "
-                f"Set env var ARTIFACTS_R2_SECRET_ACCESS_KEY or SSM SecureString {R2_SECRET_ACCESS_KEY_SSM_PARAM}"
-            )
-        _check_placeholder(
-            r2_secret_access_key,
-            f"R2 secret access key (SSM {R2_SECRET_ACCESS_KEY_SSM_PARAM})",
+            "secret access key",
         )
 
         if not endpoint_url:

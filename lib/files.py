@@ -87,26 +87,32 @@ def _excluded(relative: Path, root: Path, kind: str, patterns: tuple[str, ...]) 
     return bool(pattern) and any(fnmatch.fnmatchcase(pattern, p) for p in patterns)
 
 
+def _walk_root(root: Path, patterns: tuple[str, ...]):
+    """Yield entries before their children. Excluded paths have no kind and are pruned."""
+    root_info = _inspect(root)
+    if root_info is None:
+        return
+    pending = [(root, root_info)]
+    while pending:
+        path, info = pending.pop()
+        directory = stat.S_ISDIR(info.st_mode)
+        if _excluded(path.relative_to(root), root, "directory" if directory else "file", patterns):
+            yield path, info, None
+            continue
+        kind = _kind(info, path)
+        yield path, info, kind
+        if kind == "directory":
+            pending.extend((child, child.lstat()) for child in path.iterdir())
+
+
 def select_inputs(config: CacheConfig) -> list[SourceEntry]:
-    """Walk included directories and sort by manifest path for stable hard-link targets."""
+    """Sort included entries by manifest path for stable hard-link targets."""
     entries = []
     for wire, root in config.root_paths.items():
-        root_info = _inspect(root)
-        if root_info is None:
-            continue
-
-        pending = [(root, root_info)]
-        while pending:
-            source, info = pending.pop()
-            kind = "directory" if stat.S_ISDIR(info.st_mode) else "file"
-            if _excluded(source.relative_to(root), root, kind, config.exclusions):
-                continue
-            relative = wire / source.relative_to(root)
-            _wire_path(relative.as_posix())
-            kind = _kind(info, source)
-            entries.append(SourceEntry(relative, source, kind, info))
-            if kind == "directory":
-                pending.extend((child, child.lstat()) for child in source.iterdir())
+        for path, info, kind in _walk_root(root, config.exclusions):
+            if kind is not None:
+                relative = _wire_path((wire / path.relative_to(root)).as_posix())
+                entries.append(SourceEntry(relative, path, kind, info))
     return sorted(entries, key=lambda item: item.relative.as_posix())
 
 
@@ -256,11 +262,9 @@ def _manifest_entries(records: list, config: CacheConfig) -> dict[str, dict]:
             reference = entry["size"], entry["generation"]
             if payloads.setdefault(entry["sha256"], reference) != reference:
                 raise ValueError(f"conflicting cache payload references for {spelling!r}")
-        # Ancestors above a standalone root are implicit. Inside it the writer
-        # records each directory, including its permission bits.
-        while path.as_posix() != root.as_posix():
-            path = path.parent
-            directories.add(path.as_posix())
+        # Each recorded parent requires its own parent, up to the configured root.
+        if path != root:
+            directories.add(path.parent.as_posix())
     if any(resolved.get(locations.get(d), {}).get("type") != "directory" for d in directories):
         raise ValueError("cache manifest is missing a required directory entry")
     for local, entry in resolved.items():
@@ -332,24 +336,14 @@ def _stale_entries(config: CacheConfig, entries: dict[str, dict]) -> list[tuple[
     candidates = []
     keep = set(map(Path, entries))
     for root in config.root_paths.values():
-        root_info = _inspect(root)
-        if root_info is None:
-            continue
-        pending = [(root, root_info)]
-        while pending:
-            path, info = pending.pop()
-            directory = stat.S_ISDIR(info.st_mode)
-            kind = "directory" if directory else "file"
-            if _excluded(path.relative_to(root), root, kind, config.exclusions):
+        for path, _, kind in _walk_root(root, config.exclusions):
+            if kind is None:
                 keep.add(path.parent)
                 continue
-            kind = _kind(info, path)
             candidates.append((path, kind))
-            if directory:
-                # Leave the configured directory in place even when the cache is cold.
-                if path == root:
-                    keep.add(root)
-                pending.extend((child, child.lstat()) for child in path.iterdir())
+            # Leave the configured directory in place even when the cache is cold.
+            if path == root and kind == "directory":
+                keep.add(root)
 
     stale = []
     for path, kind in reversed(candidates):

@@ -8,7 +8,7 @@ import math
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 from typing import Mapping
 from urllib.parse import quote
@@ -121,9 +121,10 @@ def _git_ref(env: Mapping[str, str]) -> str | None:
     value = env.get(PREFIX + "GIT_REF", "true").strip()
     if not value:
         raise ValueError("git-ref must be a boolean, branch name, or full Git ref")
-    if value.lower() in ("false", "0", "off", "no"):
+    # Buildkite flattens booleans to lowercase strings. Other spellings are branch names.
+    if value == "false":
         return None
-    if value.lower() not in ("true", "1", "on", "yes"):
+    if value != "true":
         return value if value.startswith("refs/") else f"refs/heads/{value}"
 
     tag = env.get("BUILDKITE_TAG")
@@ -218,12 +219,13 @@ def _configured_roots(
     return {Path(s): locations[s] for s in specs}, ()
 
 
-def validate_local_roots(config: CacheConfig, *, clearing=False) -> None:
-    """Check live aliases only for enabled operations so access failures follow strict mode."""
+def bind_local_roots(config: CacheConfig, *, clearing=False) -> CacheConfig:
+    """Check live overlaps and bind external paths when an enabled operation starts."""
     checked = [config.state_dir.parent.parent.resolve(), config.state_dir.parent.resolve()]
-    for local in config.root_paths.values():
+    bound = {}
+    for wire, configured in config.root_paths.items():
         # Cache the leaf itself (which may be a symlink), while comparing its real parent.
-        local = local.parent.resolve() / local.name
+        local = configured.parent.resolve() / configured.name
         if any(local.is_relative_to(p) or p.is_relative_to(local) for p in checked):
             raise CacheRootError(
                 f"cache root overlaps the plugin or another cache root: {str(local)!r}"
@@ -235,6 +237,12 @@ def validate_local_roots(config: CacheConfig, *, clearing=False) -> None:
                 f"clearing this cache root would include the checkout or home: {str(local)!r}"
             )
         checked.append(local)
+        # Only explicit absolute and home paths opt into traversing agent-owned aliases.
+        # Checkout-relative paths still traverse the checkout under the normal link checks.
+        spec = Path(config.external_layout[int(wire.name)]) if config.external_layout else wire
+        external = spec.is_absolute() or spec.parts[:1] == ("~",)
+        bound[wire] = local if external else configured
+    return replace(config, root_paths=bound)
 
 
 def load_config(

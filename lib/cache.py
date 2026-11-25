@@ -21,7 +21,7 @@ from plugin_config import (
     CacheConfig,
     CacheRootError,
     load_config,
-    validate_local_roots,
+    bind_local_roots,
 )
 
 
@@ -107,7 +107,7 @@ def _prepare_candidate(config, client, bucket, prefix, ref, staging, on_bytes):
 
 def restore(config: CacheConfig, tmp_dir: Path) -> dict:
     """Stage each candidate, install the first complete hit, or clear after a clean miss."""
-    validate_local_roots(config, clearing=config.clear)
+    config = bind_local_roots(config, clearing=config.clear)
     try:
         client, bucket, prefix = object_store.open_store(config)
     except ValueError as exc:
@@ -190,7 +190,7 @@ def _store_payloads(
 
 def save(config: CacheConfig, tmp_dir: Path) -> dict:
     """Select local inputs, reuse compatible payloads, and publish after all uploads succeed."""
-    validate_local_roots(config)
+    config = bind_local_roots(config)
     selection = files.select_inputs(config)
     if not selection:
         return {"outcome": "skipped: missing inputs or no payload", "bytes": 0}

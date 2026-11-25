@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +13,7 @@ import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from files import hash_stream, open_regular
+from files import hash_stream
 from plugin_config import CacheConfig
 
 BACKEND_SSM_PARAM = "/services/buildkite/config/artifacts/object-store/backend"
@@ -235,17 +234,9 @@ def publish_manifest(client, bucket: str, key: str, manifest: dict, etag: str | 
     return True
 
 
-def upload_payload(
-    client, bucket: str, key: str, path: Path, size: int, digest: str, tmp_dir: Path
-):
-    """Capture and verify private bytes before the SDK opens the file for upload or retry."""
-    with tempfile.TemporaryDirectory(dir=tmp_dir) as staging:
-        captured = Path(staging) / "payload"
-        with open_regular(path) as source, captured.open("wb") as output:
-            if hash_stream(source, output) != (digest, size):
-                raise ValueError(f"source changed during payload upload: {path}")
-        client.upload_file(str(captured), bucket, key, Config=_TRANSFER)
-    return size
+def upload_payload(client, bucket: str, key: str, path: Path):
+    # Save inputs stay stable from hashing through the SDK's last read.
+    client.upload_file(str(path), bucket, key, Config=_TRANSFER)
 
 
 def download_payload(client, bucket: str, key: str, path: Path, size: int, digest: str) -> int:

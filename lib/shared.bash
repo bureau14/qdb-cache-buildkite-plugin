@@ -2,13 +2,7 @@
 set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Cleanup recursively removes this directory. Every hook must have a job-specific
-# component before it can use the state shared by parallel jobs.
-if [[ ! "${BUILDKITE_JOB_ID:-}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-  echo "qdb-cache: invalid or missing BUILDKITE_JOB_ID" >&2
-  exit 1
-fi
-STATE_DIR="${PLUGIN_DIR}/.state/${BUILDKITE_JOB_ID}"
+STATE_DIR="${PLUGIN_DIR}/.state/${BUILDKITE_JOB_ID:?}"
 VENV_DIR="${STATE_DIR}/.venv"
 CACHE_PY="${PLUGIN_DIR}/lib/cache.py"
 

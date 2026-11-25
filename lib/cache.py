@@ -162,11 +162,11 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
         client.close()
 
 
-def _store_payloads(
-    client, bucket, prefix, entries, sources, previous_entries, tmp_dir, parallelism
-):
+def _store_payloads(client, bucket, prefix, entries, sources, previous_entries, parallelism):
     """Reuse committed objects and finish all new uploads before the manifest can be published."""
-    generations = dict(files.payload_reference(e) for e in previous_entries if e["type"] == "file")
+    generations = {
+        (e["sha256"], e["size"]): e["generation"] for e in previous_entries if e["type"] == "file"
+    }
     # Separate writers can upload concurrently without replacing bytes held by an active reader.
     generation = uuid.uuid4().hex
     pending = set()
@@ -180,7 +180,8 @@ def _store_payloads(
     def upload(digest):
         path, size = sources[digest]
         key = _payload_key(prefix, generation, digest)
-        return object_store.upload_payload(client, bucket, key, path, size, digest, tmp_dir)
+        object_store.upload_payload(client, bucket, key, path)
+        return size
 
     with ThreadPoolExecutor(max_workers=parallelism) as pool:
         return sum(pool.map(upload, pending))
@@ -205,7 +206,7 @@ def save(config: CacheConfig, tmp_dir: Path) -> dict:
             previous_entries = files.compatible_entries(previous, config) or []
         entries, sources = files.capture(selection)
         transferred = _store_payloads(
-            client, bucket, target, entries, sources, previous_entries, tmp_dir, config.parallelism
+            client, bucket, target, entries, sources, previous_entries, config.parallelism
         )
         if not config.force and previous_entries == entries:
             return {"outcome": "unchanged", "bytes": transferred}
@@ -225,7 +226,7 @@ def run(operation: str) -> int:
     """Validate configuration, dispatch operations, and report its result."""
     try:
         config = load_config()
-    except (KeyError, ValueError, OSError, RuntimeError) as exc:
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError) as exc:
         log(f"configuration error: {exc}")
         annotate(operation, "configuration", [str(exc)], fatal=True)
         return 1
@@ -239,10 +240,7 @@ def run(operation: str) -> int:
     started = time.monotonic()
     try:
         config.state_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix=f"{operation}-", dir=config.state_dir
-        ) as tmp_directory:
-            result = handler(config, Path(tmp_directory))
+        result = handler(config, config.state_dir)
     except CacheRootError as exc:
         result = {"outcome": "configuration error", "fatal": True, "errors": [str(exc)]}
     except Exception as exc:

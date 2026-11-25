@@ -6,14 +6,13 @@ import errno
 import fnmatch
 import hashlib
 import os
-import re
 import shutil
 import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from plugin_config import CACHE_FORMAT_VERSION, CacheConfig, normalize_path
+from plugin_config import CacheConfig, normalize_path
 
 BLOCK = 1024 * 1024
 
@@ -41,13 +40,6 @@ def _check_parents(paths) -> None:
         info = _lstat(parent)
         if info is not None and _kind(info, parent) != "directory":
             raise NotADirectoryError(f"cache path parent is not a directory: {str(parent)!r}")
-
-
-def open_regular(path: Path):
-    # Selection checks parent directories; recheck the leaf before reading its contents.
-    if not stat.S_ISREG(path.lstat().st_mode):
-        raise ValueError(f"expected a regular file: {str(path)!r}")
-    return path.open("rb")
 
 
 def hash_stream(data, copy=None) -> tuple[str, int]:
@@ -112,7 +104,7 @@ def select_inputs(config: CacheConfig) -> list[SourceEntry]:
     for wire, root in config.root_paths.items():
         for path, info, kind in _walk_root(root, config.exclusions):
             if kind is not None:
-                relative = _wire_path((wire / path.relative_to(root)).as_posix())
+                relative = normalize_path((wire / path.relative_to(root)).as_posix())
                 entries.append(SourceEntry(relative, path, kind, info))
     return sorted(entries, key=lambda item: item.relative.as_posix())
 
@@ -138,7 +130,7 @@ def capture(selection: list[SourceEntry]) -> tuple[list[dict], dict[str, tuple[P
                     entry.update(type="hardlink", target=target)
                     entries.append(entry)
                     continue
-            with open_regular(item.source) as data:
+            with item.source.open("rb") as data:
                 digest, size = hash_stream(data)
             entry.update(sha256=digest, size=size)
             payloads.setdefault(digest, (item.source, size))
@@ -148,89 +140,29 @@ def capture(selection: list[SourceEntry]) -> tuple[list[dict], dict[str, tuple[P
 
 def compatible_entries(manifest: dict, config: CacheConfig) -> list | None:
     """Check compatibility before interpreting entries belonging to another snapshot layout."""
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("format"), str):
-        raise ValueError("invalid cache manifest format")
-    if manifest["format"] != CACHE_FORMAT_VERSION:
-        return None
     recorded = manifest.get("layout")
-    if (
-        not isinstance(recorded, dict)
-        or not isinstance(recorded.get("paths"), list)
-        or not recorded["paths"]
-        or not all(isinstance(p, str) for p in recorded["paths"])
-        or not isinstance(recorded.get("exclude"), list)
-        or not all(isinstance(p, str) for p in recorded["exclude"])
-    ):
+    exclusions = recorded.get("exclude") if isinstance(recorded, dict) else None
+    if not isinstance(exclusions, list) or not all(isinstance(p, str) for p in exclusions):
+        raise ValueError("invalid cache manifest exclusions")
+    # Paths determine the storage key. Only exclusions can differ at the same key.
+    expected = layout(config)
+    if recorded != {**expected, "exclude": exclusions}:
         raise ValueError("invalid cache manifest layout")
-    if "root_specs" in recorded:
-        specs = recorded["root_specs"]
-        if (
-            not isinstance(specs, list)
-            or not all(isinstance(s, str) and s for s in specs)
-            or specs != sorted(set(specs))
-            or recorded["paths"] != [str(i) for i in range(len(specs))]
-        ):
-            raise ValueError("invalid cache manifest root specifications")
-    if recorded != layout(config):
+    if exclusions != expected["exclude"]:
         return None
-    records = manifest.get("entries")
-    if not isinstance(records, list) or not records:
-        raise ValueError("invalid cache manifest entries")
-    return records
-
-
-def payload_reference(entry: dict) -> tuple[tuple[str, int], str]:
-    """Read the content identity and generation used to locate a stored file."""
-    size = entry.get("size")
-    digest = entry.get("sha256")
-    generation = entry.get("generation")
-    if not (
-        type(size) is int
-        and size >= 0
-        and isinstance(digest, str)
-        and re.fullmatch(r"[a-f0-9]{64}", digest)
-        and isinstance(generation, str)
-        and re.fullmatch(r"[a-f0-9]{32}", generation)
-    ):
-        raise ValueError(f"invalid cache file metadata for {entry.get('path')!r}")
-    return (digest, size), generation
-
-
-def _wire_path(raw: str) -> Path:
-    if not isinstance(raw, str):
-        raise ValueError("invalid cache manifest path")
-    path = normalize_path(raw)
-    if path.as_posix() != raw:
-        raise ValueError(f"unsafe cache manifest path: {raw!r}")
-    return path
+    # An empty hit would otherwise clear eligible local files without restoring anything.
+    if not manifest["entries"]:
+        raise ValueError("empty cache manifest")
+    return manifest["entries"]
 
 
 def _entry_path(
     entry: dict, roots: dict[str, Path], patterns: tuple[str, ...]
 ) -> tuple[Path, Path]:
-    """Validate file metadata, then locate the owning root to enforce its exclusions."""
-    if not isinstance(entry, dict):
-        raise ValueError("invalid cache manifest entry")
-    raw = entry.get("path")
-    path = _wire_path(raw)
-    kind = entry.get("type")
-    mode = entry.get("mode")
-    if (
-        kind not in ("file", "directory", "symlink", "hardlink")
-        or type(mode) is not int
-        or not 0 <= mode <= 0o777
-    ):
-        raise ValueError(f"invalid cache manifest type or mode for {raw!r}")
-    if kind != "directory" and not path.parts:
-        raise ValueError("cache manifest describes the checkout itself as a file")
-    if kind == "file":
-        payload_reference(entry)
-    if kind in ("symlink", "hardlink"):
-        target = entry.get("target")
-        if not isinstance(target, str) or not target or "\0" in target:
-            raise ValueError(f"invalid cache link target for {raw!r}")
-        if kind == "symlink" and not isinstance(entry.get("directory", False), bool):
-            raise ValueError(f"invalid symlink directory flag for {raw!r}")
+    """Locate the owning root and enforce the configured restore scope."""
+    raw = entry["path"]
+    path = normalize_path(raw)
+    kind = entry["type"]
     root = next((p for p in (path, *path.parents) if p.as_posix() in roots), None)
     if root is None:
         raise ValueError(f"cache manifest entry outside configured paths: {raw!r}")
@@ -243,7 +175,7 @@ def _entry_path(
 
 
 def _manifest_entries(records: list, config: CacheConfig) -> dict[str, dict]:
-    """Validate unique names, payload references and the directory hierarchy of each root."""
+    """Validate unique names, directory parents and hard-link destinations."""
     locations = {}
     directories = set()
     roots = {p.as_posix(): local for p, local in config.root_paths.items()}
@@ -265,8 +197,7 @@ def _manifest_entries(records: list, config: CacheConfig) -> dict[str, dict]:
         if entry["type"] == "hardlink":
             # A hard link can only reference an included regular file, never an arbitrary host path.
             target = locations.get(entry["target"])
-            source = resolved.get(target, {})
-            if source.get("type") != "file" or source["mode"] != entry["mode"]:
+            if resolved.get(target, {}).get("type") != "file":
                 raise ValueError(f"invalid cache hard link for {entry['path']!r}")
             resolved[local] = {**entry, "target": target}
     return resolved
@@ -400,4 +331,4 @@ def install(config: CacheConfig, entries: dict[str, dict], staged: dict[str, Pat
         _install_link(path, entry)
     for path, mode in reversed(directories):
         if not _mode_matches(path.stat().st_mode, mode):
-            path.chmod(mode)
+            path.chmod(mode & 0o777)

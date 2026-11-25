@@ -56,8 +56,8 @@ def _ssm_get_optional(ssm, name):
 _PLACEHOLDER_PREFIXES = ("SET_ME", "REPLACE_", "TODO", "CHANGEME", "FIXME")
 
 
-def _required_r2_setting(ssm, env_name, ssm_name, label):
-    value = os.environ.get(env_name) or _ssm_get_optional(ssm, ssm_name)
+def _required_r2_setting(get_parameter, env_name, ssm_name, label):
+    value = os.environ.get(env_name) or get_parameter(ssm_name)
     if not value:
         raise ValueError(
             f"R2 backend requires {label}. Set env var {env_name} or SSM parameter {ssm_name}"
@@ -70,11 +70,11 @@ def _required_r2_setting(ssm, env_name, ssm_name, label):
     return value
 
 
-def load_store_config(ssm):
+def load_store_config(get_parameter):
     """Resolve backend config: env vars → SSM → defaults.
     For R2, endpoint URL defaults to https://{account_id}.r2.cloudflarestorage.com."""
     backend = (
-        (os.environ.get("ARTIFACTS_BACKEND") or _ssm_get_optional(ssm, BACKEND_SSM_PARAM) or "s3")
+        (os.environ.get("ARTIFACTS_BACKEND") or get_parameter(BACKEND_SSM_PARAM) or "s3")
         .strip()
         .lower()
     )
@@ -85,9 +85,7 @@ def load_store_config(ssm):
             f"Check env var ARTIFACTS_BACKEND or SSM parameter {BACKEND_SSM_PARAM}"
         )
 
-    destination = os.environ.get("ARTIFACTS_DESTINATION") or _ssm_get_optional(
-        ssm, DESTINATION_SSM_PARAM
-    )
+    destination = os.environ.get("ARTIFACTS_DESTINATION") or get_parameter(DESTINATION_SSM_PARAM)
     if not destination:
         raise ValueError(
             f"artifact destination not configured. "
@@ -98,16 +96,16 @@ def load_store_config(ssm):
     endpoint_url = os.environ.get("ARTIFACTS_ENDPOINT_URL")
 
     if backend == "r2":
-        endpoint_url = endpoint_url or _ssm_get_optional(ssm, ENDPOINT_URL_SSM_PARAM)
+        endpoint_url = endpoint_url or get_parameter(ENDPOINT_URL_SSM_PARAM)
 
         r2_account_id = _required_r2_setting(
-            ssm, "ARTIFACTS_R2_ACCOUNT_ID", R2_ACCOUNT_ID_SSM_PARAM, "account ID"
+            get_parameter, "ARTIFACTS_R2_ACCOUNT_ID", R2_ACCOUNT_ID_SSM_PARAM, "account ID"
         )
         r2_access_key_id = _required_r2_setting(
-            ssm, "ARTIFACTS_R2_ACCESS_KEY_ID", R2_ACCESS_KEY_ID_SSM_PARAM, "access key ID"
+            get_parameter, "ARTIFACTS_R2_ACCESS_KEY_ID", R2_ACCESS_KEY_ID_SSM_PARAM, "access key ID"
         )
         r2_secret_access_key = _required_r2_setting(
-            ssm,
+            get_parameter,
             "ARTIFACTS_R2_SECRET_ACCESS_KEY",
             R2_SECRET_ACCESS_KEY_SSM_PARAM,
             "secret access key",
@@ -155,21 +153,17 @@ def _s3_client(cfg, operation: CacheConfig):
         "request_checksum_calculation": "when_required",
         "max_pool_connections": operation.parallelism,
     }
-    if cfg.backend == "r2":
-        client_options.update(
-            signature_version="s3v4",
-            s3={"addressing_style": "path"},
-        )
-    kwargs = {"config": sdk_config(operation, **client_options)}
-    if cfg.backend == "r2":
-        kwargs["region_name"] = "auto"
+    kwargs = {}
     if cfg.endpoint_url:
         kwargs["endpoint_url"] = cfg.endpoint_url
     if cfg.backend == "r2":
-        kwargs["aws_access_key_id"] = cfg.r2_access_key_id
-        kwargs["aws_secret_access_key"] = cfg.r2_secret_access_key
-
-    return boto3.client("s3", **kwargs)
+        client_options.update(signature_version="s3v4", s3={"addressing_style": "path"})
+        kwargs.update(
+            region_name="auto",
+            aws_access_key_id=cfg.r2_access_key_id,
+            aws_secret_access_key=cfg.r2_secret_access_key,
+        )
+    return boto3.client("s3", config=sdk_config(operation, **client_options), **kwargs)
 
 
 def sdk_config(operation: CacheConfig, **kwargs):
@@ -181,42 +175,26 @@ def sdk_config(operation: CacheConfig, **kwargs):
     )
 
 
-def aws_clients(operation: CacheConfig):
-    """Return the SSM client for config resolution; transfers own a separate S3 client."""
-    session = boto3.session.Session()
-    region_name = os.environ.get("AWS_DEFAULT_REGION", "eu-west-1")
-    return session.client("ssm", config=sdk_config(operation, region_name=region_name))
-
-
-class LazySsmClient:
-    """Create SSM client only if config resolution actually needs SSM."""
-
-    def __init__(self, operation: CacheConfig):
-        self._operation = operation
-        self._client = None
-
-    def _ensure_client(self):
-        if self._client is None:
-            self._client = aws_clients(self._operation)
-        return self._client
-
-    def get_parameter(self, *args, **kwargs):
-        return self._ensure_client().get_parameter(*args, **kwargs)
-
-    def close(self):
-        if self._client is not None:
-            self._client.close()
-
-
 def open_store(operation: CacheConfig):
-    ssm = LazySsmClient(operation)
+    """Resolve settings with SSM on demand, then open the configured object store."""
+    ssm = None
+
+    def get_parameter(name):
+        nonlocal ssm
+        if ssm is None:
+            region = os.environ.get("AWS_DEFAULT_REGION", "eu-west-1")
+            ssm = boto3.session.Session().client(
+                "ssm", config=sdk_config(operation, region_name=region)
+            )
+        return _ssm_get_optional(ssm, name)
+
     try:
-        cfg = load_store_config(ssm)
-        bucket, prefix = parse_s3(cfg.destination)
-        client = _s3_client(cfg, operation)
-        return client, bucket, prefix
+        cfg = load_store_config(get_parameter)
     finally:
-        ssm.close()
+        if ssm is not None:
+            ssm.close()
+    bucket, prefix = parse_s3(cfg.destination)
+    return _s3_client(cfg, operation), bucket, prefix
 
 
 def get_manifest(client, bucket: str, key: str) -> tuple[dict | None, str | None]:

@@ -28,21 +28,24 @@ def layout(config: CacheConfig) -> dict:
     return header
 
 
-def _inspect(path: Path) -> os.stat_result | None:
-    """Inspect the leaf itself, allowing traversal only through ordinary directories."""
-    for component in (*reversed(path.parents), path):
-        try:
-            info = component.lstat()
-        except FileNotFoundError:
-            return None
-        if component == path:
-            return info
-        if _kind(info, component) != "directory":
-            raise NotADirectoryError(f"cache path parent is not a directory: {str(component)!r}")
+def _lstat(path: Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+
+def _check_parents(paths) -> None:
+    # Inspect shared ancestors once, parent first, so lstat never traverses an unchecked link.
+    for parent in sorted({parent for path in paths for parent in path.parents}):
+        info = _lstat(parent)
+        if info is not None and _kind(info, parent) != "directory":
+            raise NotADirectoryError(f"cache path parent is not a directory: {str(parent)!r}")
 
 
 def open_regular(path: Path):
-    info = _inspect(path)
+    _check_parents([path])
+    info = _lstat(path)
     if info is None:
         raise FileNotFoundError(path)
     if not stat.S_ISREG(info.st_mode):
@@ -89,7 +92,7 @@ def _excluded(relative: Path, root: Path, kind: str, patterns: tuple[str, ...]) 
 
 def _walk_root(root: Path, patterns: tuple[str, ...]):
     """Yield entries before their children. Excluded paths have no kind and are pruned."""
-    root_info = _inspect(root)
+    root_info = _lstat(root)
     if root_info is None:
         return
     pending = [(root, root_info)]
@@ -108,6 +111,7 @@ def _walk_root(root: Path, patterns: tuple[str, ...]):
 def select_inputs(config: CacheConfig) -> list[SourceEntry]:
     """Sort included entries by manifest path for stable hard-link targets."""
     entries = []
+    _check_parents(config.root_paths.values())
     for wire, root in config.root_paths.items():
         for path, info, kind in _walk_root(root, config.exclusions):
             if kind is not None:
@@ -145,7 +149,7 @@ def capture(selection: list[SourceEntry]) -> tuple[list[dict], dict[str, tuple[P
     return entries, payloads
 
 
-def _validated_entries(manifest: dict, config: CacheConfig) -> dict | None:
+def compatible_entries(manifest: dict, config: CacheConfig) -> list | None:
     """Check compatibility before interpreting entries belonging to another snapshot layout."""
     if not isinstance(manifest, dict) or not isinstance(manifest.get("format"), str):
         raise ValueError("invalid cache manifest format")
@@ -175,12 +179,24 @@ def _validated_entries(manifest: dict, config: CacheConfig) -> dict | None:
     records = manifest.get("entries")
     if not isinstance(records, list) or not records:
         raise ValueError("invalid cache manifest entries")
-    return _manifest_entries(records, config)
+    return records
 
 
-def validate_manifest(manifest: dict, config: CacheConfig) -> bool:
-    """Only a structurally valid, matching manifest can supply payloads for the next save."""
-    return _validated_entries(manifest, config) is not None
+def payload_reference(entry: dict) -> tuple[tuple[str, int], str]:
+    """Read the content identity and generation used to locate a stored file."""
+    size = entry.get("size")
+    digest = entry.get("sha256")
+    generation = entry.get("generation")
+    if not (
+        type(size) is int
+        and size >= 0
+        and isinstance(digest, str)
+        and re.fullmatch(r"[a-f0-9]{64}", digest)
+        and isinstance(generation, str)
+        and re.fullmatch(r"[a-f0-9]{32}", generation)
+    ):
+        raise ValueError(f"invalid cache file metadata for {entry.get('path')!r}")
+    return (digest, size), generation
 
 
 def _wire_path(raw: str) -> Path:
@@ -210,15 +226,8 @@ def _entry_path(
         raise ValueError(f"invalid cache manifest type or mode for {raw!r}")
     if kind != "directory" and not path.parts:
         raise ValueError("cache manifest describes the checkout itself as a file")
-    if kind == "file" and not (
-        type(entry.get("size")) is int
-        and entry["size"] >= 0
-        and isinstance(entry.get("sha256"), str)
-        and re.fullmatch(r"[a-f0-9]{64}", entry["sha256"])
-        and isinstance(entry.get("generation"), str)
-        and re.fullmatch(r"[a-f0-9]{32}", entry["generation"])
-    ):
-        raise ValueError(f"invalid cache file metadata for {raw!r}")
+    if kind == "file":
+        payload_reference(entry)
     if kind in ("symlink", "hardlink"):
         target = entry.get("target")
         if not isinstance(target, str) or not target or "\0" in target:
@@ -236,16 +245,9 @@ def _entry_path(
     return root, path
 
 
-def _validate_destination(path: Path, kind: str) -> None:
-    info = _inspect(path)
-    if info is not None and (_kind(info, path) == "directory") != (kind == "directory"):
-        raise ValueError(f"incompatible local cache file type: {str(path)!r}")
-
-
 def _manifest_entries(records: list, config: CacheConfig) -> dict[str, dict]:
     """Validate unique names, payload references and the directory hierarchy of each root."""
     locations = {}
-    payloads = {}
     directories = set()
     roots = {p.as_posix(): local for p, local in config.root_paths.items()}
     resolved = {}
@@ -257,10 +259,6 @@ def _manifest_entries(records: list, config: CacheConfig) -> dict[str, dict]:
         local = str(roots[root.as_posix()] / path.relative_to(root))
         locations[spelling] = local
         resolved[local] = entry
-        if entry["type"] == "file":
-            reference = entry["size"], entry["generation"]
-            if payloads.setdefault(entry["sha256"], reference) != reference:
-                raise ValueError(f"conflicting cache payload references for {spelling!r}")
         # Each recorded parent requires its own parent, up to the configured root.
         if path != root:
             directories.add(path.parent.as_posix())
@@ -279,11 +277,19 @@ def _manifest_entries(records: list, config: CacheConfig) -> dict[str, dict]:
 
 def destinations(config: CacheConfig, manifest: dict) -> dict[str, dict] | None:
     """Resolve a compatible snapshot and check all live destinations before downloads."""
-    resolved = _validated_entries(manifest, config)
-    if resolved is None:
+    records = compatible_entries(manifest, config)
+    if records is None:
         return None
-    for name, entry in resolved.items():
-        _validate_destination(Path(name), entry["type"])
+    resolved = _manifest_entries(records, config)
+    # Every parent inside a cache root has a directory record. Check those records
+    # before their children; staging and installation then use this job-owned tree.
+    roots = config.root_paths.values()
+    _check_parents(root for root in roots if config.clear or str(root) in resolved)
+    for path in sorted(map(Path, resolved)):
+        info = _lstat(path)
+        expects_directory = resolved[str(path)]["type"] == "directory"
+        if info is not None and (_kind(info, path) == "directory") != expects_directory:
+            raise ValueError(f"incompatible local cache file type: {str(path)!r}")
     return resolved
 
 
@@ -298,8 +304,8 @@ def stage_local(path: Path, entry: dict, staged: Path) -> bool:
     """Verify local bytes and stage a private copy when permissions or links require it."""
     expected = entry["sha256"], entry["size"]
     try:
-        info = _inspect(path)
-        if info is None or not stat.S_ISREG(info.st_mode) or info.st_size != entry["size"]:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size != entry["size"]:
             return False
         with path.open("rb") as data:
             if info.st_nlink == 1 and _mode_matches(info.st_mode, entry["mode"]):
@@ -324,7 +330,6 @@ def _replace(source: Path, path: Path, mode: int) -> None:
                 raise
             shutil.copyfile(source, temporary)
         os.chmod(temporary, mode & 0o777)
-        _validate_destination(path, "file")
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -355,7 +360,6 @@ def _stale_entries(config: CacheConfig, entries: dict[str, dict]) -> list[tuple[
 
 def _install_link(path: Path, entry: dict) -> None:
     # Prepare beside the destination so a failed link creation preserves the old entry.
-    _validate_destination(path, entry["type"])
     if entry["type"] == "symlink" and path.is_symlink() and os.readlink(path) == entry["target"]:
         if os.name != "nt" or bool(
             path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_DIRECTORY
@@ -366,19 +370,17 @@ def _install_link(path: Path, entry: dict) -> None:
         if entry["type"] == "symlink":
             link.symlink_to(entry["target"], target_is_directory=entry.get("directory", False))
         else:
-            source = Path(entry["target"])
-            info = _inspect(source)
-            if info is None or not stat.S_ISREG(info.st_mode):
-                raise ValueError(f"missing regular file for hard link: {str(source)!r}")
-            os.link(source, link)
+            os.link(entry["target"], link)
         os.replace(link, path)
 
 
 def install(config: CacheConfig, entries: dict[str, dict], staged: dict[str, Path]) -> None:
     """Clear stale paths, install verified files before their links, then apply directory modes."""
     if config.clear:
+        if not entries:
+            # A clean miss has no manifest preflight before clearing the configured roots.
+            _check_parents(config.root_paths.values())
         for path, kind in _stale_entries(config, entries):
-            _validate_destination(path, kind)
             if kind == "directory":
                 path.rmdir()
             else:
@@ -388,7 +390,6 @@ def install(config: CacheConfig, entries: dict[str, dict], staged: dict[str, Pat
     for name, entry in sorted(entries.items()):
         path = Path(name)
         kind = entry["type"]
-        _validate_destination(path, kind)
         if kind == "directory":
             path.mkdir(parents=True, exist_ok=True)
             directories.append((path, entry["mode"]))

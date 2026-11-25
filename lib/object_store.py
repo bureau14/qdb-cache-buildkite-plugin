@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -271,21 +270,13 @@ def upload_payload(
     return size
 
 
-def download_payload(
-    client, bucket: str, key: str, path: Path, size: int, digest: str, *, on_bytes=None
-):
+def download_payload(client, bucket: str, key: str, path: Path, size: int, digest: str) -> int:
     """Stream the payload into staging and verify its size and SHA-256 before installation."""
     response = client.get_object(Bucket=bucket, Key=key)
     with closing(response["Body"]) as body:
         if response["ContentLength"] != size:
             raise ValueError(f"payload length differs from manifest: {key}")
-        checksum = hashlib.sha256()
         with path.open("wb") as output:
-            for chunk in iter(lambda: body.read(_TRANSFER.io_chunksize), b""):
-                if on_bytes is not None:
-                    on_bytes(len(chunk))
-                output.write(chunk)
-                checksum.update(chunk)
-            if output.tell() != size or checksum.hexdigest() != digest:
+            if hash_stream(body, output) != (digest, size):
                 raise ValueError(f"payload length or SHA-256 differs from manifest: {key}")
     return size

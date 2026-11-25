@@ -10,9 +10,9 @@ import sys
 import tempfile
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Lock
 
 import files
 import object_store
@@ -60,7 +60,7 @@ def _payload_key(prefix, generation, digest):
     return f"{prefix}/objects/{generation}/{digest}"
 
 
-def _stage_files(client, bucket, prefix, destinations, tmp_dir, on_bytes, parallelism):
+def _stage_files(client, bucket, prefix, destinations, tmp_dir, parallelism, downloaded):
     """Prepare private replacements concurrently against the one resolved manifest."""
 
     def prepare(item):
@@ -69,15 +69,15 @@ def _stage_files(client, bucket, prefix, destinations, tmp_dir, on_bytes, parall
         if files.stage_local(Path(path), entry, staged):
             return path, staged if staged.exists() else None
         digest = entry["sha256"]
-        object_store.download_payload(
+        size = object_store.download_payload(
             client,
             bucket,
             _payload_key(prefix, entry["generation"], digest),
             staged,
             entry["size"],
             digest,
-            on_bytes=on_bytes,
         )
+        downloaded.append(size)
         return path, staged
 
     file_entries = (
@@ -88,9 +88,8 @@ def _stage_files(client, bucket, prefix, destinations, tmp_dir, on_bytes, parall
         return {path: staged for path, staged in prepared if staged is not None}
 
 
-def _prepare_candidate(config, client, bucket, prefix, ref, staging, on_bytes):
-    """Read the candidate once so every staged file comes from the same publication."""
-    candidate = config.cache_prefix(prefix, ref)
+def _candidate_destinations(config, client, bucket, candidate, ref):
+    """Resolve destinations from a single manifest for this fallback candidate."""
     manifest, _ = object_store.get_manifest(client, bucket, f"{candidate}/manifest.json")
     if manifest is None:
         log(f"missing ref={ref or 'shared'!r}")
@@ -98,11 +97,7 @@ def _prepare_candidate(config, client, bucket, prefix, ref, staging, on_bytes):
     destinations = files.destinations(config, manifest)
     if destinations is None:
         log(f"incompatible ref={ref or 'shared'!r}")
-        return None
-    replacements = _stage_files(
-        client, bucket, candidate, destinations, staging, on_bytes, config.parallelism
-    )
-    return destinations, replacements
+    return destinations
 
 
 def restore(config: CacheConfig, tmp_dir: Path) -> dict:
@@ -114,30 +109,35 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
         return {"outcome": "configuration error", "fatal": True, "errors": [str(exc)]}
 
     result = {"outcome": "miss", "errors": [], "bytes": 0}
-    count_lock = Lock()
-
-    def count_bytes(size):
-        # Parallel streams, including failed candidates, contribute to the hook total.
-        with count_lock:
-            result["bytes"] += size
 
     try:
         for ref in config.fallback_refs:
             ref_label = ref or "shared"
             with tempfile.TemporaryDirectory(dir=tmp_dir) as staging:
+                downloaded = deque()
                 try:
-                    prepared = _prepare_candidate(
-                        config, client, bucket, prefix, ref, Path(staging), count_bytes
-                    )
-                    if prepared is None:
+                    candidate = config.cache_prefix(prefix, ref)
+                    destinations = _candidate_destinations(config, client, bucket, candidate, ref)
+                    if destinations is None:
                         continue
-                    destinations, replacements = prepared
+                    replacements = _stage_files(
+                        client,
+                        bucket,
+                        candidate,
+                        destinations,
+                        Path(staging),
+                        config.parallelism,
+                        downloaded,
+                    )
                 except Exception as exc:
                     result["errors"].append(f"ref={ref_label!r}: {exc}")
                     result["outcome"] = "error"
                     if config.strict:
                         return result
                     continue
+                finally:
+                    # A rejected candidate can still have completed sibling downloads.
+                    result["bytes"] += sum(downloaded)
                 try:
                     files.install(config, destinations, replacements)
                 except Exception as exc:
@@ -166,9 +166,7 @@ def _store_payloads(
     client, bucket, prefix, entries, sources, previous_entries, tmp_dir, parallelism
 ):
     """Reuse committed objects and finish all new uploads before the manifest can be published."""
-    generations = {
-        (e["sha256"], e["size"]): e["generation"] for e in previous_entries if e["type"] == "file"
-    }
+    generations = dict(files.payload_reference(e) for e in previous_entries if e["type"] == "file")
     # Separate writers can upload concurrently without replacing bytes held by an active reader.
     generation = uuid.uuid4().hex
     pending = set()
@@ -203,8 +201,8 @@ def save(config: CacheConfig, tmp_dir: Path) -> dict:
         key = f"{target}/manifest.json"
         previous, etag = object_store.get_manifest(client, bucket, key)
         previous_entries = []
-        if previous is not None and files.validate_manifest(previous, config):
-            previous_entries = previous["entries"]
+        if previous is not None:
+            previous_entries = files.compatible_entries(previous, config) or []
         entries, sources = files.capture(selection)
         transferred = _store_payloads(
             client, bucket, target, entries, sources, previous_entries, tmp_dir, config.parallelism

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PLUGIN_PREFIX="QDB_CACHE"
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Cleanup recursively removes this directory. Every hook must have a job-specific
 # component before it can use the state shared by parallel jobs.
@@ -43,12 +42,10 @@ else
   VENV_BIN="${VENV_DIR}/bin"
 fi
 
-plugin_read_config() {
-  local var="BUILDKITE_PLUGIN_${PLUGIN_PREFIX}_${1}"
-  local default="${2:-}"
-  echo "${!var:-$default}"
-}
-
 run_cache_py() {
   "${VENV_BIN}/python" "${CACHE_PY}" "$@"
 }
+
+if [[ "${BUILDKITE_PLUGIN_QDB_CACHE_DEBUG:-}" =~ ^(true|on|1)$ ]]; then
+  set -x
+fi

@@ -236,9 +236,6 @@ def run(operation: str) -> int:
     if not enabled:
         log(f"{operation} disabled; identity={config.identity!r} bytes=0")
         return 0
-    if operation == "save" and os.environ.get("BUILDKITE_COMMAND_EXIT_STATUS") != "0":
-        log(f"save skipped: command success was not explicit; identity={config.identity!r} bytes=0")
-        return 0
     started = time.monotonic()
     try:
         config.state_dir.mkdir(parents=True, exist_ok=True)

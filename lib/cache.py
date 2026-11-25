@@ -60,7 +60,7 @@ def _payload_key(prefix, generation, digest):
     return f"{prefix}/objects/{generation}/{digest}"
 
 
-def _stage_files(client, bucket, prefix, destinations, tmp_dir, on_bytes):
+def _stage_files(client, bucket, prefix, destinations, tmp_dir, on_bytes, parallelism):
     """Prepare private replacements concurrently against the one resolved manifest."""
 
     def prepare(item):
@@ -83,7 +83,7 @@ def _stage_files(client, bucket, prefix, destinations, tmp_dir, on_bytes):
     file_entries = (
         (path, entry) for path, entry in destinations.items() if entry["type"] == "file"
     )
-    with ThreadPoolExecutor(max_workers=object_store.MAX_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=parallelism) as pool:
         prepared = pool.map(prepare, enumerate(file_entries))
         return {path: staged for path, staged in prepared if staged is not None}
 
@@ -99,7 +99,9 @@ def _prepare_candidate(config, client, bucket, prefix, ref, staging, on_bytes):
     if destinations is None:
         log(f"incompatible ref={ref or 'shared'!r}")
         return None
-    replacements = _stage_files(client, bucket, candidate, destinations, staging, on_bytes)
+    replacements = _stage_files(
+        client, bucket, candidate, destinations, staging, on_bytes, config.parallelism
+    )
     return destinations, replacements
 
 
@@ -160,7 +162,9 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
         client.close()
 
 
-def _store_payloads(client, bucket, prefix, entries, sources, previous_entries, tmp_dir):
+def _store_payloads(
+    client, bucket, prefix, entries, sources, previous_entries, tmp_dir, parallelism
+):
     """Reuse committed objects and finish all new uploads before the manifest can be published."""
     generations = {
         (e["sha256"], e["size"]): e["generation"] for e in previous_entries if e["type"] == "file"
@@ -180,7 +184,7 @@ def _store_payloads(client, bucket, prefix, entries, sources, previous_entries, 
         key = _payload_key(prefix, generation, digest)
         return object_store.upload_payload(client, bucket, key, path, size, digest, tmp_dir)
 
-    with ThreadPoolExecutor(max_workers=object_store.MAX_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=parallelism) as pool:
         return sum(pool.map(upload, pending))
 
 
@@ -197,20 +201,13 @@ def save(config: CacheConfig, tmp_dir: Path) -> dict:
     try:
         target = config.cache_prefix(prefix)
         key = f"{target}/manifest.json"
-        previous, etag = object_store.get_manifest(
-            client, bucket, key, tolerate_invalid=config.force
-        )
+        previous, etag = object_store.get_manifest(client, bucket, key)
         previous_entries = []
-        try:
-            if previous is not None and files.validate_manifest(previous, config):
-                previous_entries = previous["entries"]
-        except ValueError:
-            # Without trusted references, a forced save uploads every digest from local inputs.
-            if not config.force:
-                raise
+        if previous is not None and files.validate_manifest(previous, config):
+            previous_entries = previous["entries"]
         entries, sources = files.capture(selection)
         transferred = _store_payloads(
-            client, bucket, target, entries, sources, previous_entries, tmp_dir
+            client, bucket, target, entries, sources, previous_entries, tmp_dir, config.parallelism
         )
         if not config.force and previous_entries == entries:
             return {"outcome": "unchanged", "bytes": transferred}

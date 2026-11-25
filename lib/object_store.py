@@ -14,7 +14,6 @@ from pathlib import Path
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
-from botocore import exceptions
 from botocore.exceptions import ClientError
 from files import hash_stream, open_regular
 from plugin_config import CacheConfig
@@ -26,12 +25,8 @@ R2_ACCOUNT_ID_SSM_PARAM = "/services/buildkite/config/artifacts/object-store/r2/
 R2_ACCESS_KEY_ID_SSM_PARAM = "/services/buildkite/config/artifacts/object-store/r2/access-key-id"
 R2_SECRET_ACCESS_KEY_SSM_PARAM = "/services/buildkite/credentials/artifacts/r2/secret-access-key"
 
-# File workers share one client. Parts run serially inside a worker, so streaming
-# bodies and multipart requests use the same four request slots as small files.
-MAX_WORKERS = 4
+# File workers share one client. Serial multipart transfers keep one request per worker.
 _TRANSFER = TransferConfig(use_threads=False, preferred_transfer_client="classic")
-_BODY_ATTEMPTS = 2
-_STREAM_ERRORS = (exceptions.HTTPClientError, exceptions.IncompleteReadError)
 
 
 @dataclass(frozen=True)
@@ -182,7 +177,10 @@ def _s3_client(cfg, operation: CacheConfig):
     account-level, not bucket-level — virtual-host style would produce invalid hostnames).
     """
     # Both backends use the manifest SHA-256 for end-to-end file verification.
-    client_options = {"request_checksum_calculation": "when_required"}
+    client_options = {
+        "request_checksum_calculation": "when_required",
+        "max_pool_connections": operation.parallelism,
+    }
     if cfg.backend == "r2":
         client_options.update(
             signature_version="s3v4",
@@ -247,22 +245,7 @@ def open_store(operation: CacheConfig):
         ssm.close()
 
 
-def _manifest_fields(pairs):
-    # A repeated field can assign different layouts or destinations to the same
-    # document depending on the JSON decoder. Such a candidate is an error.
-    fields = dict(pairs)
-    if len(fields) != len(pairs):
-        raise ValueError("duplicate JSON member in cache manifest")
-    return fields
-
-
-def _invalid_constant(token):
-    raise ValueError(f"invalid JSON number in cache manifest: {token}")
-
-
-def get_manifest(
-    client, bucket: str, key: str, *, tolerate_invalid=False
-) -> tuple[dict | None, str | None]:
+def get_manifest(client, bucket: str, key: str) -> tuple[dict | None, str | None]:
     """Read the snapshot and its ETag together so a writer can condition its publication."""
     try:
         response = client.get_object(Bucket=bucket, Key=key)
@@ -272,21 +255,12 @@ def get_manifest(
             return None, None
         raise
     with closing(response["Body"]) as body:
-        raw = body.read()
+        document = json.load(body)
+    if not isinstance(document, dict):
+        raise ValueError("cache manifest must be a JSON object")
     etag = response.get("ETag")
     if not isinstance(etag, str) or not etag or etag == "*":
         raise ValueError("object store returned no usable ETag for cache manifest")
-    try:
-        document = json.loads(
-            raw, object_pairs_hook=_manifest_fields, parse_constant=_invalid_constant
-        )
-        if not isinstance(document, dict):
-            raise ValueError("cache manifest must be a JSON object")
-    except (ValueError, RecursionError):
-        if not tolerate_invalid:
-            raise
-        # A forced repair still needs to match the version containing the malformed bytes.
-        document = None
     return document, etag
 
 
@@ -325,27 +299,18 @@ def upload_payload(
 def download_payload(
     client, bucket: str, key: str, path: Path, size: int, digest: str, *, on_bytes=None
 ):
-    """Fetch the immutable key from the manifest, retry interrupted bodies, and verify the bytes."""
-    transferred = 0
-    # Each GET has its own configured SDK request attempts. Once the SDK hands
-    # us a response, an interrupted body needs a fresh GET for the same key.
-    for attempt in range(1, _BODY_ATTEMPTS + 1):
-        response = client.get_object(Bucket=bucket, Key=key)
-        try:
-            with closing(response["Body"]) as body:
-                if response["ContentLength"] != size:
-                    raise ValueError(f"payload length differs from manifest: {key}")
-                checksum = hashlib.sha256()
-                with path.open("wb") as output:
-                    for chunk in iter(lambda: body.read(_TRANSFER.io_chunksize), b""):
-                        transferred += len(chunk)
-                        if on_bytes is not None:
-                            on_bytes(len(chunk))
-                        output.write(chunk)
-                        checksum.update(chunk)
-                    if output.tell() != size or checksum.hexdigest() != digest:
-                        raise ValueError(f"payload length or SHA-256 differs from manifest: {key}")
-            return transferred
-        except _STREAM_ERRORS:
-            if attempt == _BODY_ATTEMPTS:
-                raise
+    """Stream the payload into staging and verify its size and SHA-256 before installation."""
+    response = client.get_object(Bucket=bucket, Key=key)
+    with closing(response["Body"]) as body:
+        if response["ContentLength"] != size:
+            raise ValueError(f"payload length differs from manifest: {key}")
+        checksum = hashlib.sha256()
+        with path.open("wb") as output:
+            for chunk in iter(lambda: body.read(_TRANSFER.io_chunksize), b""):
+                if on_bytes is not None:
+                    on_bytes(len(chunk))
+                output.write(chunk)
+                checksum.update(chunk)
+            if output.tell() != size or checksum.hexdigest() != digest:
+                raise ValueError(f"payload length or SHA-256 differs from manifest: {key}")
+    return size

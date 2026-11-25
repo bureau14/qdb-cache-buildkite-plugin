@@ -9,7 +9,7 @@ configuration:
     - path
   properties:
     path:
-      description:  Files or directories to cache
+      description: Files or directories to cache
       oneOf:
         - type: string
           minLength: 1
@@ -35,8 +35,11 @@ configuration:
           value:
             type: string
     git-ref:
-      type: boolean
-      description: Include the Git ref in cache identity
+      oneOf:
+        - type: boolean
+        - type: string
+          minLength: 1
+      description: Use the current Git ref (true), share across refs (false), or select a branch name or full ref
       default: true
     restore:
       type: boolean
@@ -68,6 +71,10 @@ configuration:
     strict:
       type: boolean
       default: false
+    parallelism:
+      type: integer
+      minimum: 1
+      description: Maximum concurrent file transfers, defaulting to the agent CPU count
     retries:
       type: integer
       minimum: 1

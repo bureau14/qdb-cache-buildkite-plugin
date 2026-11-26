@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Cache restore/save and hook entry point."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import files
+import object_store
+from plugin_config import (
+    CacheConfig,
+    CacheRootError,
+    load_config,
+    bind_local_roots,
+)
+
+
+def log(message: str) -> None:
+    print(f"[qdb-cache] {message}", file=sys.stderr, flush=True)
+
+
+def annotate(operation: str, identity: str, messages: list[str], fatal: bool) -> None:
+    if not os.environ.get("BUILDKITE"):
+        return
+    body = f"qdb-cache {operation} error for {identity!r}:\n\n" + "\n\n".join(messages)
+    executable = "buildkite-agent.exe" if os.name == "nt" else "buildkite-agent"
+    try:
+        subprocess.run(
+            [
+                executable,
+                "annotate",
+                "--context",
+                f"qdb-cache-{operation}",
+                "--style",
+                "error" if fatal else "warning",
+                "--scope",
+                "job",
+            ],
+            input=body,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"annotation reporting failed ({type(exc).__name__}); original result retained")
+
+
+def _payload_key(prefix, generation, digest):
+    return f"{prefix}/objects/{generation}/{digest}"
+
+
+def _stage_files(client, bucket, prefix, destinations, tmp_dir, parallelism, downloaded):
+    """Prepare private replacements concurrently against the one resolved manifest."""
+
+    def prepare(item):
+        index, (path, entry) = item
+        staged = tmp_dir / str(index)
+        if files.stage_local(Path(path), entry, staged):
+            return path, staged if staged.exists() else None
+        digest = entry["sha256"]
+        size = object_store.download_payload(
+            client,
+            bucket,
+            _payload_key(prefix, entry["generation"], digest),
+            staged,
+            entry["size"],
+            digest,
+        )
+        downloaded.append(size)
+        return path, staged
+
+    file_entries = (
+        (path, entry) for path, entry in destinations.items() if entry["type"] == "file"
+    )
+    with ThreadPoolExecutor(max_workers=parallelism) as pool:
+        prepared = pool.map(prepare, enumerate(file_entries))
+        return {path: staged for path, staged in prepared if staged is not None}
+
+
+def _candidate_destinations(config, client, bucket, candidate, key):
+    """Resolve destinations from a single manifest for this fallback candidate."""
+    manifest, _ = object_store.get_manifest(client, bucket, f"{candidate}/manifest.json")
+    if manifest is None:
+        log(f"missing key={key!r}")
+        return None
+    destinations = files.destinations(config, manifest)
+    if destinations is None:
+        log(f"incompatible key={key!r}")
+    return destinations
+
+
+def restore(config: CacheConfig, tmp_dir: Path) -> dict:
+    """Stage each candidate, install the first complete hit, or clear after a clean miss."""
+    config = bind_local_roots(config, clearing=config.clear)
+    try:
+        client, bucket, prefix = object_store.open_store(config)
+    except ValueError as exc:
+        return {"outcome": "configuration error", "fatal": True, "errors": [str(exc)]}
+
+    result = {"outcome": "miss", "errors": [], "bytes": 0}
+
+    try:
+        keys = [config.key]
+        if config.restore_key is not None and config.restore_key != config.key:
+            keys.append(config.restore_key)
+        for key in keys:
+            with tempfile.TemporaryDirectory(dir=tmp_dir) as staging:
+                downloaded = deque()
+                try:
+                    candidate = config.cache_prefix(prefix, key)
+                    destinations = _candidate_destinations(config, client, bucket, candidate, key)
+                    if destinations is None:
+                        continue
+                    replacements = _stage_files(
+                        client,
+                        bucket,
+                        candidate,
+                        destinations,
+                        Path(staging),
+                        config.parallelism,
+                        downloaded,
+                    )
+                except Exception as exc:
+                    result["errors"].append(f"key={key!r}: {exc}")
+                    result["outcome"] = "error"
+                    if config.strict:
+                        return result
+                    continue
+                finally:
+                    # A rejected candidate can still have completed sibling downloads.
+                    result["bytes"] += sum(downloaded)
+                try:
+                    files.install(config, destinations, replacements)
+                except Exception as exc:
+                    # Fallback is safe only before installation starts changing live files.
+                    result["errors"].append(f"install key={key!r}: {exc}")
+                    result["outcome"] = "error"
+                    return result
+                log(f"restored source-key={key!r} target-key={config.key!r}")
+                result["outcome"] = "restored"
+                return result
+
+        # A failed read may hide a valid snapshot. Clear on a miss only when
+        # every candidate was confirmed missing or incompatible.
+        if config.clear and not result["errors"]:
+            try:
+                files.install(config, {}, {})
+            except Exception as exc:
+                result["errors"].append(f"clear after miss: {exc}")
+                result["outcome"] = "error"
+        return result
+    finally:
+        client.close()
+
+
+def _store_payloads(client, bucket, prefix, entries, sources, previous_entries, parallelism):
+    """Reuse committed objects and finish all new uploads before the manifest can be published."""
+    generations = {
+        (e["sha256"], e["size"]): e["generation"] for e in previous_entries if e["type"] == "file"
+    }
+    # Separate writers can upload concurrently without replacing bytes held by an active reader.
+    generation = uuid.uuid4().hex
+    pending = set()
+    for entry in entries:
+        if entry["type"] == "file":
+            digest = entry["sha256"]
+            entry["generation"] = generations.get((digest, entry["size"]), generation)
+            if entry["generation"] == generation:
+                pending.add(digest)
+
+    def upload(digest):
+        path, size = sources[digest]
+        key = _payload_key(prefix, generation, digest)
+        object_store.upload_payload(client, bucket, key, path)
+        return size
+
+    with ThreadPoolExecutor(max_workers=parallelism) as pool:
+        return sum(pool.map(upload, pending))
+
+
+def save(config: CacheConfig) -> dict:
+    """Select local inputs, reuse compatible payloads, and publish after all uploads succeed."""
+    config = bind_local_roots(config)
+    selection = files.select_inputs(config)
+    if not selection:
+        return {"outcome": "skipped: missing inputs or no payload", "bytes": 0}
+    try:
+        client, bucket, prefix = object_store.open_store(config)
+    except ValueError as exc:
+        return {"outcome": "configuration error", "fatal": True, "errors": [str(exc)]}
+    try:
+        target = config.cache_prefix(prefix, config.key)
+        key = f"{target}/manifest.json"
+        previous, etag = object_store.get_manifest(client, bucket, key)
+        previous_entries = []
+        if previous is not None:
+            previous_entries = files.compatible_entries(previous, config) or []
+        entries, sources = files.capture(selection)
+        transferred = _store_payloads(
+            client, bucket, target, entries, sources, previous_entries, config.parallelism
+        )
+        if not config.force and previous_entries == entries:
+            return {"outcome": "unchanged", "bytes": transferred}
+        manifest = {
+            "layout": files.layout(config),
+            "entries": entries,
+        }
+        if not object_store.publish_manifest(client, bucket, key, manifest, etag):
+            return {"outcome": "skipped: concurrent manifest change", "bytes": transferred}
+        return {"outcome": "saved", "bytes": transferred}
+    finally:
+        client.close()
+
+
+def run(operation: str) -> int:
+    """Validate configuration, dispatch operations, and report its result."""
+    try:
+        config = load_config()
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError) as exc:
+        log(f"configuration error: {exc}")
+        annotate(operation, "configuration", [str(exc)], fatal=True)
+        return 1
+    enabled = {"restore": config.restore, "save": config.save}[operation]
+    if not enabled:
+        log(f"{operation} disabled; identity={config.identity!r} bytes=0")
+        return 0
+    started = time.monotonic()
+    try:
+        if operation == "restore":
+            config.state_dir.mkdir(parents=True, exist_ok=True)
+            result = restore(config, config.state_dir)
+        else:
+            result = save(config)
+    except CacheRootError as exc:
+        result = {"outcome": "configuration error", "fatal": True, "errors": [str(exc)]}
+    except Exception as exc:
+        result = {"outcome": "error", "errors": [str(exc)]}
+    errors = result.get("errors", [])
+    fatal = bool(result.get("fatal") or (errors and config.strict))
+    log(
+        f"{operation} outcome={result['outcome']!r} identity={config.identity!r} "
+        f"target-key={config.key!r} bytes={result.get('bytes', 'unknown')} "
+        f"duration={time.monotonic() - started:.3f}s"
+    )
+    if errors:
+        for error in errors:
+            log(error)
+        annotate(operation, config.identity, errors, fatal)
+    return 1 if fatal else 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Restore or save a Buildkite cache")
+    parser.add_argument("operation", choices=("restore", "save"))
+    args = parser.parse_args(argv)
+    return run(args.operation)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

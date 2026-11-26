@@ -1,0 +1,72 @@
+name: QDB Cache
+description: Restore and refresh file snapshots in S3 compatible storage
+author: https://github.com/bureau14
+requirements:
+  - bash
+configuration:
+  additionalProperties: false
+  required:
+    - path
+  properties:
+    path:
+      description: Files or directories to cache
+      oneOf:
+        - type: string
+          minLength: 1
+        - type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+    key:
+      type: string
+      minLength: 1
+      description: Cache key to restore and save within this pipeline and set of paths
+    restore-key:
+      type: string
+      minLength: 1
+      description: Optional fallback key to try when restoring
+    restore:
+      type: boolean
+      default: true
+    clear:
+      type: boolean
+      description: Remove stale eligible files in the configured roots before the command when restoring
+      default: true
+    save:
+      type: boolean
+      default: true
+    exclude:
+      oneOf:
+        - type: string
+          minLength: 1
+        - type: array
+          items:
+            type: string
+            minLength: 1
+    force:
+      type: boolean
+      default: false
+    strict:
+      type: boolean
+      default: false
+    parallelism:
+      type: integer
+      minimum: 1
+      description: Maximum concurrent file transfers, defaulting to the agent CPU count
+    retries:
+      type: integer
+      minimum: 1
+      default: 3
+    connect-timeout:
+      type: number
+      exclusiveMinimum: 0
+      default: 10
+    read-timeout:
+      type: number
+      exclusiveMinimum: 0
+      default: 60
+    debug:
+      type: boolean
+      default: false

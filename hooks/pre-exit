@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${DIR}/../lib/shared.bash"
+
+if [[ -e "${STATE_DIR}" || -L "${STATE_DIR}" ]]; then
+  # A failed setup can leave an existing directory that this job does not own.
+  PYTHON3_CMD="$(plugin_python)"
+  check_state_dir "${PYTHON3_CMD}"
+  rm -rf "${STATE_DIR}"
+fi

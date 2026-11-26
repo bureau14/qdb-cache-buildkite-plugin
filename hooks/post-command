@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${DIR}/../lib/shared.bash"
+
+if [[ "${BUILDKITE_COMMAND_EXIT_STATUS:-}" != "0" ]]; then
+  echo "~~~ Skipping cache save (command did not succeed)"
+  exit 0
+fi
+
+run_cache_py save

@@ -20,15 +20,14 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 class CacheConfig:
     root_paths: dict[str, Path]
     working_dir: Path
-    pairs: dict[str, str]
+    key: str | None
+    restore_key: str | None
     exclusions: tuple[str, ...]
     pipeline: str
-    git_ref: str | None
     state_dir: Path
     restore: bool
     clear: bool
     save: bool
-    fallback_refs: tuple[str | None, ...]
     force: bool
     strict: bool
     retries: int
@@ -38,20 +37,20 @@ class CacheConfig:
 
     @property
     def identity(self) -> str:
-        return self.cache_prefix("")
+        return self.cache_prefix("", self.key)
 
-    def cache_prefix(self, prefix: str, git_ref: str | None = None) -> str:
+    def cache_prefix(self, prefix: str, key: str | None) -> str:
         # Hash portable specifications so checkout and home locations can differ across agents.
         encoded_paths = json.dumps(sorted(self.root_paths), separators=(",", ":")).encode("ascii")
         parts = [
             prefix.strip("/"),
             self.pipeline,
-            (git_ref or self.git_ref) if self.git_ref is not None else None,
             "cache",
             CACHE_FORMAT_VERSION,
             "paths-" + hashlib.sha256(encoded_paths).hexdigest(),
         ]
-        parts.extend(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in self.pairs.items())
+        if key is not None:
+            parts.append(f"key={quote(key, safe='')}")
         return "/".join(p for p in parts if p)
 
 
@@ -66,11 +65,13 @@ def _strings(value) -> tuple[str, ...]:
     return tuple(values)
 
 
-def _pairs(items) -> dict[str, str]:
-    pairs = {item["key"]: item["value"] for item in items}
-    if "" in pairs or len(pairs) != len(items):
-        raise ValueError("cache keys must be nonempty and unique")
-    return dict(sorted(pairs.items()))
+def _optional_key(options, name: str) -> str | None:
+    if name not in options:
+        return None
+    value = options[name]
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be a nonempty string")
+    return value
 
 
 def _positive_integer(value, name: str) -> int:
@@ -83,28 +84,6 @@ def _positive_timeout(value, name: str) -> float:
     if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be a positive finite number")
     return value
-
-
-def _git_ref(env: Mapping[str, str], value) -> str | None:
-    """Select the configured branch, shared namespace, or current Buildkite ref."""
-    if isinstance(value, str):
-        value = value.strip()
-    if value is False or value == "false":
-        return None
-    if value is not True and value != "true":
-        if not isinstance(value, str) or not value:
-            raise ValueError("git-ref must be a boolean, branch name, or full Git ref")
-        return value if value.startswith("refs/") else f"refs/heads/{value}"
-
-    tag = env.get("BUILDKITE_TAG")
-    if tag:
-        return tag if tag.startswith("refs/") else f"refs/tags/{tag}"
-
-    branch = env.get("BUILDKITE_BRANCH")
-    if branch:
-        return branch if branch.startswith("refs/") else f"refs/heads/{branch}"
-
-    raise ValueError("BUILDKITE_BRANCH or BUILDKITE_TAG is required")
 
 
 def normalize_path(raw: str, *, allow_parent: bool = False) -> Path:
@@ -194,7 +173,7 @@ def bind_local_roots(config: CacheConfig, *, clearing=False) -> CacheConfig:
 def load_config(
     env: Mapping[str, str] | None = None, cwd: Path | None = None, plugin_dir: Path = PLUGIN_DIR
 ) -> CacheConfig:
-    """Load cache paths, identity, fallback refs, and SDK options from Buildkite."""
+    """Load cache paths, keys, and SDK options from Buildkite."""
     env = os.environ if env is None else env
     checkout = _checkout(env, cwd)
     options = json.loads(env["BUILDKITE_PLUGIN_CONFIGURATION"])
@@ -203,28 +182,20 @@ def load_config(
     state_dir = plugin_dir / ".state" / env["BUILDKITE_JOB_ID"]
     validate_state_dir(checkout, state_dir)
     pipeline = env["BUILDKITE_PIPELINE_SLUG"]
-    git_ref = _git_ref(env, options.get("git-ref", True))
-    mode = options.get("fallback", "default")
-    if mode not in {"default", "disabled"}:
-        raise ValueError("fallback must be default or disabled")
-    refs = [git_ref]
-    if git_ref is not None and mode == "default":
-        refs.extend(ref for ref in ("refs/heads/master", "refs/heads/main") if ref != git_ref)
     paths = _strings(options["path"])
     if not paths:
         raise ValueError("path: expected at least one value")
     return CacheConfig(
         root_paths=_configured_roots(paths, checkout),
         working_dir=checkout,
-        pairs=_pairs(options.get("keys", [])),
+        key=_optional_key(options, "key"),
+        restore_key=_optional_key(options, "restore-key"),
         exclusions=tuple(sorted(set(_strings(options.get("exclude", []))))),
         pipeline=pipeline,
-        git_ref=git_ref,
         state_dir=state_dir,
         restore=_boolean(options.get("restore", True)),
         clear=_boolean(options.get("clear", True)),
         save=_boolean(options.get("save", True)),
-        fallback_refs=tuple(refs),
         force=_boolean(options.get("force", False)),
         strict=_boolean(options.get("strict", False)),
         retries=_positive_integer(options.get("retries", 3), "retries"),

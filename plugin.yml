@@ -19,28 +19,14 @@ configuration:
           items:
             type: string
             minLength: 1
-    keys:
-      type: array
-      description: Pipeline-owned dimensions, sorted by their original case-sensitive keys
-      items:
-        type: object
-        additionalProperties: false
-        required:
-          - key
-          - value
-        properties:
-          key:
-            type: string
-            minLength: 1
-          value:
-            type: string
-    git-ref:
-      oneOf:
-        - type: boolean
-        - type: string
-          minLength: 1
-      description: Use the current Git ref (true), share across refs (false), or select a branch name or full ref
-      default: true
+    key:
+      type: string
+      minLength: 1
+      description: Cache key to restore and save within this pipeline and set of paths
+    restore-key:
+      type: string
+      minLength: 1
+      description: Optional fallback key to try when restoring
     restore:
       type: boolean
       default: true
@@ -51,12 +37,6 @@ configuration:
     save:
       type: boolean
       default: true
-    fallback:
-      type: string
-      enum:
-        - default
-        - disabled
-      default: default
     exclude:
       oneOf:
         - type: string

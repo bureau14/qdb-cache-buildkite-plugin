@@ -87,15 +87,15 @@ def _stage_files(client, bucket, prefix, destinations, tmp_dir, parallelism, dow
         return {path: staged for path, staged in prepared if staged is not None}
 
 
-def _candidate_destinations(config, client, bucket, candidate, ref):
+def _candidate_destinations(config, client, bucket, candidate, key):
     """Resolve destinations from a single manifest for this fallback candidate."""
     manifest, _ = object_store.get_manifest(client, bucket, f"{candidate}/manifest.json")
     if manifest is None:
-        log(f"missing ref={ref or 'shared'!r}")
+        log(f"missing key={key!r}")
         return None
     destinations = files.destinations(config, manifest)
     if destinations is None:
-        log(f"incompatible ref={ref or 'shared'!r}")
+        log(f"incompatible key={key!r}")
     return destinations
 
 
@@ -110,13 +110,15 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
     result = {"outcome": "miss", "errors": [], "bytes": 0}
 
     try:
-        for ref in config.fallback_refs:
-            ref_label = ref or "shared"
+        keys = [config.key]
+        if config.restore_key is not None and config.restore_key != config.key:
+            keys.append(config.restore_key)
+        for key in keys:
             with tempfile.TemporaryDirectory(dir=tmp_dir) as staging:
                 downloaded = deque()
                 try:
-                    candidate = config.cache_prefix(prefix, ref)
-                    destinations = _candidate_destinations(config, client, bucket, candidate, ref)
+                    candidate = config.cache_prefix(prefix, key)
+                    destinations = _candidate_destinations(config, client, bucket, candidate, key)
                     if destinations is None:
                         continue
                     replacements = _stage_files(
@@ -129,7 +131,7 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
                         downloaded,
                     )
                 except Exception as exc:
-                    result["errors"].append(f"ref={ref_label!r}: {exc}")
+                    result["errors"].append(f"key={key!r}: {exc}")
                     result["outcome"] = "error"
                     if config.strict:
                         return result
@@ -141,10 +143,10 @@ def restore(config: CacheConfig, tmp_dir: Path) -> dict:
                     files.install(config, destinations, replacements)
                 except Exception as exc:
                     # Fallback is safe only before installation starts changing live files.
-                    result["errors"].append(f"install ref={ref_label!r}: {exc}")
+                    result["errors"].append(f"install key={key!r}: {exc}")
                     result["outcome"] = "error"
                     return result
-                log(f"restored source-ref={ref_label!r} target-ref={config.git_ref or 'shared'!r}")
+                log(f"restored source-key={key!r} target-key={config.key!r}")
                 result["outcome"] = "restored"
                 return result
 
@@ -197,7 +199,7 @@ def save(config: CacheConfig) -> dict:
     except ValueError as exc:
         return {"outcome": "configuration error", "fatal": True, "errors": [str(exc)]}
     try:
-        target = config.cache_prefix(prefix)
+        target = config.cache_prefix(prefix, config.key)
         key = f"{target}/manifest.json"
         previous, etag = object_store.get_manifest(client, bucket, key)
         previous_entries = []
@@ -247,7 +249,7 @@ def run(operation: str) -> int:
     fatal = bool(result.get("fatal") or (errors and config.strict))
     log(
         f"{operation} outcome={result['outcome']!r} identity={config.identity!r} "
-        f"target-ref={config.git_ref or 'shared'!r} bytes={result.get('bytes', 'unknown')} "
+        f"target-key={config.key!r} bytes={result.get('bytes', 'unknown')} "
         f"duration={time.monotonic() - started:.3f}s"
     )
     if errors:

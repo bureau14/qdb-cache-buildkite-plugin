@@ -36,12 +36,11 @@ plugins:
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `path` | Required | List of files or directories to cache. |
-| `keys` | `[]` | Give steps separate caches, for example by compiler or OS. |
-| `git-ref` | `true` | Use the build's tag or branch. Set a branch name or full Git ref to choose one, or `false` to share across refs. |
+| `key` | Omitted | Cache key for restore and save. Omit it to share a cache by pipeline and paths alone. |
+| `restore-key` | Omitted | Optional fallback key to try during restore. |
 | `restore` | `true` | Restore the cache before the command runs. |
 | `clear` | `true` | During restore, delete local files missing from the cache. If no cache exists, clear the listed paths. Excluded files are kept. |
 | `save` | `true` | Update the cache after the command succeeds. |
-| `fallback` | `default` | Try `master`, then `main`, if the selected ref misses. Set to `disabled` to skip fallback. |
 | `exclude` | `[]` | Skip paths matching a glob pattern or list of patterns. Patterns are case-sensitive and relative to each cached directory. For a single file, they match its name. |
 | `force` | `false` | Write the manifest even when the cache contents are unchanged. |
 | `strict` | `false` | Fail the hook on save or restore errors. Setup and configuration errors always fail the hook. |
@@ -53,42 +52,31 @@ plugins:
 
 ## Sharing a cache
 
-Within a pipeline, steps share a cache when their paths, Git ref, and `keys` match. The order of paths and keys doesn't matter. To keep separate caches for different compilers, add a key:
-
-```yaml
-path: .cache
-keys:
-  - key: compiler
-    value: gcc15
-```
-
-Each key needs a unique, nonempty name and a string value. An empty string is a valid value.
-
-By default, the plugin uses the build's tag if there is one, otherwise its branch. Restore can fall back to `master` and `main`. Save always writes to the selected ref. To have jobs on different branches read and update the same branch cache, set `git-ref` explicitly:
+Within a pipeline, steps share a cache when their configured paths and key match. Path order doesn't matter. To scope a cache to a branch, include `${BUILDKITE_BRANCH}` in `key`. The example uses the master branch’s key as a restore fallback.
 
 ```yaml
 plugins:
   - bureau14/qdb-cache#master:
-      path: node_modules
-      git-ref: "master"
-      fallback: disabled
+      path: ~/.m2/repository
+      key: "m2-jdk17-${BUILDKITE_BRANCH}"
+      restore-key: "m2-jdk17-master"
 ```
 
-To share one cache across all branches and tags, use `git-ref: false`.
+Restore tries the branch's key first, then the fallback key. Save always writes to the branch's key.
 
-The manifest lists the files in the cache. For pipeline `example` on branch `feature`, the compiler example above stores it at the following location. The path hash is the SHA-256 of the configured paths.
+The manifest lists the files in the cache. For pipeline `example` on branch `feature`, the example above stores it at the following location. The path hash is the SHA-256 of the configured paths.
 
 ```text
-s3://ci-cache/buildkite/example/refs/heads/feature/cache/v1/paths-<path-hash>/compiler=gcc15/manifest.json
+s3://ci-cache/buildkite/example/cache/v1/paths-<path-hash>/key=m2-jdk17-feature/manifest.json
 ```
 
 ## How restore and save work
 
-**Restore.** The plugin reuses local files whose contents match the cache. For each download, it checks the size and SHA-256 checksum before installing the file. If the manifest or a download fails verification, it tries the next fallback unless `strict: true`.
+**Restore.** The plugin reuses local files whose contents match the cache. For each download, it checks the size and SHA-256 checksum before installing the file. If the manifest or a download fails verification, it tries the fallback key if configured, unless `strict: true`.
 
-With the default `clear: true`, restore removes extra files from the listed paths. If every ref misses, it clears those paths and the build continues. Excluded files stay in place. Set `clear: false` to keep extra local files even on a miss. The agent needs write access to the directories it restores. A filesystem error during installation can leave some files restored and others untouched.
+With the default `clear: true`, restore removes extra files from the listed paths. If no cache matches, it clears those paths and the build continues. Excluded files stay in place. Set `clear: false` to keep extra local files even on a miss. The agent needs write access to the directories it restores. A filesystem error during installation can leave some files restored and others untouched.
 
-**Save.** The plugin uploads files individually and reuses identical content from the previous compatible cache. Keep files, links, and their parent directories stable while saving. If a file changes after the plugin hashes it, the uploaded file can fail verification on restore.
+**Save.** The plugin uploads files individually and reuses identical content from the previous compatible cache. All writers must finish before save starts. Files, links, and their parent directories must stay unchanged until uploads finish. If a file changes between hashing and upload, the stored bytes can differ from the manifest checksum and later restores can fail verification.
 
 The cache preserves empty directories, file and directory permissions, and symbolic links, including links whose targets are missing. Hard links within the cache still point to the same file after restore. If only one name for a hard-linked file is cached, it restores as an independent file.
 
